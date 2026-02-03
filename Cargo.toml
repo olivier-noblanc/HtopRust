@@ -1,0 +1,40 @@
+[package]
+name = "HtopRust"
+version = "1.0.1"
+edition = "2024"
+authors = ["Olivier Noblanc"]
+description = "A modern system monitor for Windows with htop-like interface"
+license = "MIT"
+repository = "https://github.com/olivier-noblanc/HtopRust"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = "0.4.43"
+crossterm = "0.29.0"
+human-panic = "2.0.6"
+ratatui = "0.30.0"
+sys-locale = "0.3.2"
+sysinfo = "0.38.0"
+windows = { version = "0.62.2", features = ["Win32_NetworkManagement_WiFi", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_Console"] }
+
+[build-dependencies]
+winres = "0.1.12"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link Time Optimization
+codegen-units = 1   # Reduce parallel code generation for better optimization
+panic = "abort"     # Remove stack unwind support
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"
+complexity = "warn"
+perf = "warn"
+style = "warn"
+suspicious = "warn"
+unwrap_used = "warn"
+semicolon_if_nothing_returned = "warn"

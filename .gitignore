@@ -1,0 +1,24 @@
+# Rust standard
+/target
+**/*.rs.bk
+
+# Windows standard
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# User specific exclusions
+test*.txt
+build_log.txt
+build/
+*.log
+
+# Temp files
+*.bak
+*.tmp
+
+# Release assets (published separately)
+Release_Assets/
+
+# VS Code
+.vscode/

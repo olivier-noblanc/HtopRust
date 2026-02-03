@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Build Release
+        shell: pwsh
+        run: |
+          cargo build --release --verbose
+
+      - name: Verify Binary Exists
+        shell: pwsh
+        run: |
+          $binary = "target/release/htop-rust.exe"
+          if (Test-Path $binary) {
+              Write-Host "SUCCESS: Binary generated at $binary"
+          } else {
+              # Fallback check for package name HtopRust.exe
+              if (Test-Path "target/release/HtopRust.exe") {
+                   Move-Item "target/release/HtopRust.exe" $binary
+                   Write-Host "SUCCESS: Binary found and renamed to $binary"
+              } elseif (Test-Path "target/release/htop_rust.exe") {
+                   Move-Item "target/release/htop_rust.exe" $binary
+                   Write-Host "SUCCESS: Binary found and renamed to $binary"
+              } else {
+                   Write-Error "FATAL: Binary not found after build."
+                   Get-ChildItem -Recurse target/release
+                   exit 1
+              }
+          }
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/htop-rust.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

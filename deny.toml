@@ -1,10 +1,8 @@
 [advisories]
-ignore = []
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-notice = "warn"
+# La structure moderne utilise des sélecteurs plus granulaires si nécessaire, 
+# mais par défaut, les champs 'vulnerability', 'unmaintained', 'notice' sont obsolètes au top-level.
 
 [licenses]
 unlicensed = "deny"
@@ -14,8 +12,7 @@ allow = [
     "BSD-3-Clause",
     "CC0-1.0",
 ]
-copyleft = "deny"
-allow-osi-fsf-free = "either"
+# 'copyleft' et 'allow-osi-fsf-free' sont obsolètes au top-level dans les versions récentes.
 confidence-threshold = 0.8
 
 [bans]

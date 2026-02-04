@@ -11,9 +11,12 @@ allow = [
     "Apache-2.0",
     "BSD-3-Clause",
     "CC0-1.0",
+    "Zlib",
+    "Unicode-3.0",
 ]
 # 'copyleft' et 'allow-osi-fsf-free' sont obsolètes au top-level dans les versions récentes.
 confidence-threshold = 0.8
+allow-osi-fsf-free = "both"
 
 [bans]
 multiple-versions = "warn"

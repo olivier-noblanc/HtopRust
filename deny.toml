@@ -1,6 +1,6 @@
-[advisories]
-db-path = "~/.cargo/advisory-db"
-db-urls = ["https://github.com/rustsec/advisory-db"]
+# [advisories]
+# db-path = "~/.cargo/advisory-db"
+# db-urls = ["https://github.com/rustsec/advisory-db"]
 # La structure moderne utilise des sélecteurs plus granulaires si nécessaire, 
 # mais par défaut, les champs 'vulnerability', 'unmaintained', 'notice' sont obsolètes au top-level.
 
@@ -20,8 +20,8 @@ multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 
-[sources]
-unknown-registry = "deny"
-unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# [sources]
+# unknown-registry = "deny"
+# unknown-git = "deny"
+# allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# allow-git = []

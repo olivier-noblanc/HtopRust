@@ -16,7 +16,14 @@ allow = [
 ]
 # 'copyleft' et 'allow-osi-fsf-free' sont obsolètes au top-level dans les versions récentes.
 confidence-threshold = 0.8
-allow-osi-fsf-free = "both"
+
+[[licenses.exceptions]]
+allow = ["Zlib"]
+name = "foldhash"
+
+[[licenses.exceptions]]
+allow = ["Unicode-3.0"]
+name = "unicode-ident"
 
 [bans]
 multiple-versions = "warn"

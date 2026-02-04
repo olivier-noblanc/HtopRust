@@ -5,7 +5,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # mais par défaut, les champs 'vulnerability', 'unmaintained', 'notice' sont obsolètes au top-level.
 
 [licenses]
-unlicensed = "deny"
+
 allow = [
     "MIT",
     "Apache-2.0",

@@ -1,7 +1,10 @@
+.agent/*
+.antigravityignore
+*.txt
+
 # Rust standard
 /target
 **/*.rs.bk
-
 # Windows standard
 Thumbs.db
 desktop.ini

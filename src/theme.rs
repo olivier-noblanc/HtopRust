@@ -8,8 +8,11 @@ pub struct Theme {
     pub warning: Color,
     pub highlight: Color,
     pub header_bg: Color,
+    #[allow(dead_code)]
     pub header_fg: Color,
+    #[allow(dead_code)]
     pub border: Color,
+    #[allow(dead_code)]
     pub selection_bg: Color,
     pub network: Color,
 }

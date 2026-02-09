@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration as ChronoDuration, Local};
-use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use regex::Regex;
+use once_cell::sync::Lazy;
 
 #[derive(Clone)]
 pub struct EventInfo {
@@ -13,6 +13,11 @@ pub struct EventInfo {
 
 pub struct EventManager;
 
+// Compile Regexes once
+static RE_TIME: Lazy<Regex> = Lazy::new(|| Regex::new(r#"TimeCreated SystemTime=['"]([^'"]+)['"]"#).unwrap());
+static RE_PROVIDER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"Provider Name=['"]([^'"]+)['"]"#).unwrap());
+static RE_EVENTID: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<EventID[^>]*>(\d+)</EventID>"#).unwrap());
+
 impl EventManager {
     pub fn new() -> Self {
         Self
@@ -24,16 +29,17 @@ impl EventManager {
     pub fn get_system_errors_detailed(&self) -> Vec<EventInfo> {
         use windows::Win32::System::EventLog::{EvtQuery, EvtNext, EVT_HANDLE, EvtRender, EvtClose, EvtFormatMessage};
 
-        let mut fetch_channel = |channel_name: &str| -> Vec<EventInfo> {
+        // We can define a helper to fetch events from a channel
+        let fetch_channel = |channel_name: &str| -> Vec<EventInfo> {
             unsafe {
                 let query = windows::core::w!("*[System[(Level=1 or Level=2)]]"); // Errors & Criticals only
                 let channel_wide = windows::core::HSTRING::from(channel_name);
                 let channel_pcwstr = windows::core::PCWSTR(channel_wide.as_ptr());
 
-                let query_handle = match EvtQuery(None, channel_pcwstr, query, 0x201u32) {
+                let query_handle = match EvtQuery(None, channel_pcwstr, query, 0x201u32) { // EvtQueryChannelPath | EvtQueryReverseDirection
                     Ok(handle) => handle,
                     Err(e) => {
-                        eprintln!("Failed to query {channel_name}: {e:?}");
+                        // eprintln!("Failed to query {channel_name}: {e:?}");
                         return vec![EventInfo {
                             time: "Error".to_string(),
                             raw_time: String::new(),
@@ -46,7 +52,7 @@ impl EventManager {
 
                 let cutoff_time = Local::now() - ChronoDuration::try_hours(48).unwrap_or(ChronoDuration::hours(48));
                 let mut channel_events = Vec::new();
-                let mut events_buf: [isize; 10] = [0; 10];
+                let mut events_buf: [isize; 10] = [0; 10]; // Array to hold event handles (isize/HANDLE)
                 let mut returned: u32 = 0;
 
                 // Limit to 50 events per channel for performance
@@ -62,6 +68,7 @@ impl EventManager {
                         let mut buffer_used: u32 = 0;
                         let mut property_count: u32 = 0;
 
+                        // First call to get buffer size
                         let _ = EvtRender(None, event_handle, 1u32, buffer_size, None, &raw mut buffer_used, &raw mut property_count);
                         
                         buffer_size = buffer_used;
@@ -72,14 +79,21 @@ impl EventManager {
                         if render_result.is_ok() {
                             let xml = String::from_utf16_lossy(&buffer);
                             
-                            // Parse XML using quick-xml
-                            if let Some(parsed) = Self::parse_event_xml(&xml) {
+                            // Parse XML using Regex
+                            if let Some(parsed) = Self::parse_event_xml_regex(&xml) {
                                 // Check time first
                                 if let Ok(dt) = DateTime::parse_from_rfc3339(&parsed.raw_time) {
                                     if dt < cutoff_time {
                                         let _ = EvtClose(event_handle);
-                                        // Since we fetch in reverse order, if we hit an old event, we can stop.
-                                        let _ = EvtClose(query_handle); 
+                                        // Since we fetch in reverse order, key assumption: 
+                                        // If we hit an event older than cutoff, we can stop fetching from this channel.
+                                        // We must close pending handles in the buffer first.
+                                        for &pending_raw in events_buf.iter().take(returned as usize) {
+                                            if pending_raw != event_raw {
+                                                let _ = EvtClose(EVT_HANDLE(pending_raw));
+                                            }
+                                        }
+                                        let _ = EvtClose(query_handle);
                                         return channel_events; 
                                     }
                                 }
@@ -104,12 +118,7 @@ impl EventManager {
                                     }
 
                                 if !found_msg {
-                                    // Use data items from parsed XML if message formatting failed
-                                    full_message = if parsed.data_items.is_empty() { 
-                                        format!("Event {} from {}", parsed.event_id, parsed.provider) 
-                                    } else { 
-                                        parsed.data_items.join(" ") 
-                                    };
+                                    full_message = format!("Event {} from {}", parsed.event_id, parsed.provider);
                                 }
 
                                 let display_source = if channel_name == "Application" {
@@ -153,79 +162,25 @@ impl EventManager {
         all_events
     }
 
-    fn parse_event_xml(xml_str: &str) -> Option<ParsedEvent> {
-        let mut reader = Reader::from_str(xml_str);
-        reader.config_mut().trim_text(true);
+    fn parse_event_xml_regex(xml: &str) -> Option<ParsedEvent> {
+        let raw_time = RE_TIME.captures(xml)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())?;
 
-        let mut event_id = String::new();
-        let mut provider = String::new();
-        let mut raw_time = String::new();
-        let mut data_items = Vec::new();
+        let provider = RE_PROVIDER.captures(xml)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
 
-        loop {
-            match reader.read_event() {
-                Ok(Event::Start(ref e)) => {
-                    match e.name().as_ref() {
-                        b"TimeCreated" => {
-                            if let Some(attr) = e.attributes().find(|a| a.as_ref().map(|a| a.key.as_ref() == b"SystemTime").unwrap_or(false)) {
-                                if let Ok(a) = attr {
-                                    raw_time = String::from_utf8_lossy(&a.value).to_string();
-                                }
-                            }
-                        }
-                        b"Provider" => {
-                            if let Some(attr) = e.attributes().find(|a| a.as_ref().map(|a| a.key.as_ref() == b"Name").unwrap_or(false)) {
-                                if let Ok(a) = attr {
-                                    provider = String::from_utf8_lossy(&a.value).to_string();
-                                }
-                            }
-                        }
-                        b"EventID" => {
-                            if let Ok(txt) = reader.read_text(e.name()) {
-                                event_id = txt.to_string();
-                            }
-                        }
-                        b"Data" => {
-                             if let Ok(txt) = reader.read_text(e.name()) {
-                                let txt_str = txt.to_string();
-                                if !txt_str.is_empty() {
-                                    data_items.push(txt_str);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Empty(ref e)) => {
-                    match e.name().as_ref() {
-                        b"TimeCreated" => {
-                            if let Some(attr) = e.attributes().find(|a| a.as_ref().map(|a| a.key.as_ref() == b"SystemTime").unwrap_or(false)) {
-                                if let Ok(a) = attr {
-                                    raw_time = String::from_utf8_lossy(&a.value).to_string();
-                                }
-                            }
-                        }
-                        b"Provider" => {
-                            if let Some(attr) = e.attributes().find(|a| a.as_ref().map(|a| a.key.as_ref() == b"Name").unwrap_or(false)) {
-                                if let Ok(a) = attr {
-                                    provider = String::from_utf8_lossy(&a.value).to_string();
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Eof) => break,
-                Err(_) => return None,
-                _ => {}
-            }
-        }
+        let event_id = RE_EVENTID.captures(xml)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| "0".to_string());
 
         Some(ParsedEvent {
             event_id,
             provider,
             raw_time,
-            data_items,
         })
     }
 }
@@ -234,5 +189,4 @@ struct ParsedEvent {
     event_id: String,
     provider: String,
     raw_time: String,
-    data_items: Vec<String>,
 }

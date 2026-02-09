@@ -1,0 +1,131 @@
+app_title: HtopRust
+header:
+  cpu: "CPU USAGE"
+  memory: "MEMORY"
+  disks: "DISKS (FREE SPACE)"
+  events: "SYSTEM ERRORS (CLICK/E FOR DETAILS)"
+  network: "NETWORK / WIFI (CLICK FOR DETAILS)"
+  uptime: "Uptime"
+processes:
+  title: "Processes (P: Sort CPU, M: Sort Mem, K: Kill)"
+  headers: ["PID", "USER", "PRI", "VIRT", "RES", "S", "CPU%", "MEM%", "Command"]
+  not_found: "Process not found (terminated?)."
+  no_selection: "No process selected."
+  detail_title: "Process Detail"
+events:
+  title: "System Events (Esc: Back to Proc)"
+  title_detailed: "SYSTEM ERRORS"
+  no_events: "No recent errors found."
+  detail: "System Event Detail"
+  detail_not_found: "Error not found."
+  no_selection: "No event selected."
+ui:
+  quit: "Quit"
+  back: "Back"
+  details: "Details"
+  about: "About"
+  kill: "Kill process (admin)"
+  admin: "ADMIN"
+  user: "User"
+cpu_gauge_label: "CPU{index} {usage:>5.1}%"
+about:
+  title: "About HtopRust"
+  content: |
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║                              HtopRust v%{version}                                   ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    📖 ABOUT
+
+    HtopRust is a modern system monitor for Windows, inspired by the popular 'htop' 
+    tool on Linux. Built entirely in Rust, it brings the power and elegance of 
+    terminal-based monitoring to Windows with native performance and zero dependencies.
+
+    👤 AUTHOR
+
+    Created by Olivier Noblanc in 2026 as a personal project to bring professional-
+    grade system monitoring to Windows in a lightweight, portable package.
+
+    ✨ KEY FEATURES
+
+      • Real-time process monitoring (CPU, memory, status)
+      • Multi-core CPU usage graphs
+      • Memory and swap monitoring
+      • Complete Wi-Fi information with 802.1x detection
+      • Windows Event Log integration
+      • Bilingual support (EN/FR) with auto-detection
+      • UTF-8 detection with ASCII fallback for legacy terminals
+      • Admin/User privilege detection
+      • Mouse support (scroll, click navigation)
+      • Configurable refresh rate (1s/2s/5s)
+
+    ⌨️  KEYBOARD SHORTCUTS
+
+      q / F10    Quit                       ↑ ↓        Navigate
+      e          Toggle Events              Enter      View details
+      a / h      Show About                 Esc        Go back
+      k          Kill process (admin)       s          Change refresh rate
+      p          Sort by PID                c          Sort by CPU
+      m          Sort by Memory             n          Sort by Name
+
+    📄 LICENSE
+
+    MIT License - Copyright (c) 2026 Olivier Noblanc
+
+    🔧 TECHNICAL
+
+      Language   : Rust (edition 2024)
+      Framework  : Ratatui 0.30 + Crossterm 0.29
+      Optimized  : LTO + dead code elimination
+      Portable   : Single binary, no runtime dependencies
+      Compatible : Windows 7+
+footer:
+  processes: " q:Quit | ↑↓:Nav | e:Events | a/h:About | p:CPU | m:MEM | k:Kill | %{refresh}"
+  system_events: " q:Quit | Esc:Back | Enter:Detail | ↑↓:Nav | 30s"
+  wifi_details: " q:Quit | Esc:Back | 10s"
+  event_detail: " q:Quit | Esc:Back | 30s"
+  process_detail: " q:Quit | Esc:Back"
+  about: " q:Quit | Esc:Back | a/h:Toggle About"
+wifi:
+  auth: "802.1x Auth: %{method}"
+  auth_dot1x: "802.1x Auth"
+  ssid: "SSID            : %{ssid}"
+  bssid: "BSSID           : %{bssid}"
+  standard: "Standard        : %{standard}"
+  channel: "Channel         : %{channel}"
+  frequency: "Frequency       : %{frequency}"
+  auth_label: "Auth            : %{auth}"
+  cipher: "Cipher          : %{cipher}"
+  signal: "Signal          : %{signal}"
+  rx_rate: "Rx Rate         : %{rx}"
+  tx_rate: "Tx Rate         : %{tx}"
+  esc_back: "\n\nEsc: Back"
+  no_info: "No WiFi info available."
+  details_title: "WiFi Details"
+auth_algo:
+  open: "Open"
+  shared_key: "Shared Key"
+  wpa: "WPA-Enterprise"
+  wpa_psk: "WPA-PSK"
+  wpa_none: "WPA-None"
+  wpa2: "WPA2-Enterprise"
+  wpa2_psk: "WPA2-PSK"
+  wpa3: "WPA3-Enterprise"
+  wpa3_sae: "WPA3-Personal"
+  owe: "OWE"
+  vendor: "Vendor Specific"
+  unknown: "Unknown(%{id})"
+cipher_algo:
+  none: "None"
+  wep40: "WEP-40"
+  tkip: "TKIP"
+  ccmp: "AES-CCMP"
+  wep104: "WEP-104"
+  bip: "BIP"
+  gcmp: "AES-GCMP"
+  gcmp256: "AES-GCMP-256"
+  ccmp256: "AES-CCMP-256"
+  bip_gmac_128: "BIP-GMAC-128"
+  bip_gmac_256: "BIP-GMAC-256"
+  bip_cmac_256: "BIP-CMAC-256"
+  wep: "WEP"

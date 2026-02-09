@@ -31,6 +31,7 @@ pub struct CcmStatus {
 }
 
 impl CcmStatus {
+    #[allow(dead_code)]
     pub fn new(running: bool, status: String, has_errors: bool, pending_actions: u32) -> Self {
         Self {
             running,
@@ -71,6 +72,7 @@ pub struct MemoryInfo {
 
 #[derive(Clone)]
 pub struct DiskInfo {
+    #[allow(dead_code)]
     pub name: String,
     pub mount_point: String,
     pub available_space: u64,

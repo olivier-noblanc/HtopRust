@@ -1,0 +1,133 @@
+app_title: HtopRust
+header:
+  cpu: "UTILISATION CPU"
+  memory: "MÉMOIRE"
+  disks: "DISQUES (ESPACE LIBRE)"
+  events: "ERREURS SYSTÈME (CLIC/E POUR DÉTAILS)"
+  network: "RÉSEAU / WIFI (CLIC POUR DÉTAILS)"
+  uptime: "Temps d'activité"
+processes:
+  title: "Processus (P: Tri CPU, M: Tri Mém, K: Terminer)"
+  headers: ["PID", "UTIL", "PRI", "VIRT", "RES", "E", "CPU%", "MEM%", "Commande"]
+  not_found: "Processus introuvable (terminé ?)."
+  no_selection: "Aucun processus sélectionné."
+  detail_title: "Détail Processus"
+events:
+  title: "Événements Système (Esc: Retour)"
+  title_detailed: "ERREURS SYSTÈME"
+  no_events: "Aucune erreur récente."
+  detail: "Détail Événement Système"
+  detail_not_found: "Erreur introuvable."
+  no_selection: "Aucun événement sélectionné."
+ui:
+  quit: "Quitter"
+  back: "Retour"
+  details: "Détails"
+  about: "À propos"
+  kill: "Terminer processus (admin)"
+  admin: "ADMIN"
+  user: "Utilisateur"
+cpu_gauge_label: "CPU{index} {usage:>5.1}%"
+about:
+  title: "À propos de HtopRust"
+  content: |
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║                              HtopRust v%{version}                                   ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+
+    📖 À PROPOS
+
+    HtopRust est un moniteur système moderne pour Windows, inspiré du célèbre outil 
+    'htop' sur Linux. Entièrement écrit en Rust, il apporte la puissance et l'élégance 
+    de la surveillance en terminal à Windows avec des performances natives et zéro 
+    dépendance.
+
+    👤 AUTEUR
+
+    Créé par Olivier Noblanc en 2026 comme projet personnel pour apporter une 
+    surveillance système de niveau professionnel à Windows dans un package léger 
+    et portable.
+
+    ✨ FONCTIONNALITÉS PRINCIPALES
+
+      • Surveillance en temps réel des processus (CPU, mémoire, statut)
+      • Graphiques d'utilisation CPU multi-cœurs
+      • Surveillance mémoire et swap
+      • Informations complètes Wi-Fi avec détection 802.1x
+      • Intégration du journal d'événements Windows
+      • Support bilingue (EN/FR) avec détection automatique
+      • Détection UTF-8 avec repli ASCII pour terminaux anciens
+      • Détection des privilèges Admin/Utilisateur
+      • Support souris (défilement, navigation par clic)
+      • Taux de rafraîchissement configurable (1s/2s/5s)
+
+    ⌨️  RACCOURCIS CLAVIER
+
+      q / F10    Quitter                    ↑ ↓        Naviguer
+      e          Basculer Événements        Enter      Voir détails
+      a / h      Afficher À propos          Esc        Retour
+      k          Tuer processus (admin)     s          Changer taux rafraîch.
+      p          Trier par PID              c          Trier par CPU
+      m          Trier par Mémoire          n          Trier par Nom
+
+    📄 LICENCE
+
+    MIT License - Copyright (c) 2026 Olivier Noblanc
+
+    🔧 TECHNIQUE
+
+      Langage    : Rust (édition 2024)
+      Framework  : Ratatui 0.30 + Crossterm 0.29
+      Optimisé   : LTO + élimination code mort
+      Portable   : Binaire unique, aucune dépendance runtime
+      Compatible : Windows 7+
+footer:
+  processes: " q:Quitter | ↑↓:Nav | e:Événements | a/h:À propos | p:CPU | m:MEM | k:Kill | %{refresh}"
+  system_events: " q:Quitter | Esc:Retour | Enter:Détail | ↑↓:Nav | 30s"
+  wifi_details: " q:Quitter | Esc:Retour | 10s"
+  event_detail: " q:Quitter | Esc:Retour | 30s"
+  process_detail: " q:Quitter | Esc:Retour"
+  about: " q:Quitter | Esc:Retour | a/h:Basculer À propos"
+wifi:
+  auth: "Auth 802.1x: %{method}"
+  auth_dot1x: "Auth 802.1x"
+  ssid: "SSID            : %{ssid}"
+  bssid: "BSSID           : %{bssid}"
+  standard: "Standard        : %{standard}"
+  channel: "Canal           : %{channel}"
+  frequency: "Fréquence       : %{frequency}"
+  auth_label: "Auth            : %{auth}"
+  cipher: "Chiffrement     : %{cipher}"
+  signal: "Signal          : %{signal}"
+  rx_rate: "Débit Rx        : %{rx}"
+  tx_rate: "Débit Tx        : %{tx}"
+  esc_back: "\n\nEsc: Retour"
+  no_info: "Aucune info WiFi disponible."
+  details_title: "Détails WiFi"
+auth_algo:
+  open: "Ouvert"
+  shared_key: "Clé Partagée"
+  wpa: "WPA-Entreprise"
+  wpa_psk: "WPA-PSK"
+  wpa_none: "WPA-Aucun"
+  wpa2: "WPA2-Entreprise"
+  wpa2_psk: "WPA2-PSK"
+  wpa3: "WPA3-Entreprise"
+  wpa3_sae: "WPA3-Personnel"
+  owe: "OWE"
+  vendor: "Spécifique Vendeur"
+  unknown: "Inconnu(%{id})"
+cipher_algo:
+  none: "Aucun"
+  wep40: "WEP-40"
+  tkip: "TKIP"
+  ccmp: "AES-CCMP"
+  wep104: "WEP-104"
+  bip: "BIP"
+  gcmp: "AES-GCMP"
+  gcmp256: "AES-GCMP-256"
+  ccmp256: "AES-CCMP-256"
+  bip_gmac_128: "BIP-GMAC-128"
+  bip_gmac_256: "BIP-GMAC-256"
+  bip_cmac_256: "BIP-CMAC-256"
+  wep: "WEP"

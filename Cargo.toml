@@ -17,7 +17,7 @@ regex = "1.10"
 rust-i18n = "2"
 ratatui = "0.30.0"
 sys-locale = "0.3.2"
-sysinfo = "0.38.0"
+sysinfo = "0.38.1"
 windows = { version = "0.62.2", features = ["Win32_NetworkManagement_WiFi", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_Console"] }
 
 [build-dependencies]

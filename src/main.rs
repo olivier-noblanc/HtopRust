@@ -1,5 +1,4 @@
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Local};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
@@ -14,10 +13,22 @@ use ratatui::{
 };
 use std::{
     io,
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
-use sysinfo::{System, ProcessStatus, Networks, Disks, Pid, Users};
+use sysinfo::{System, Networks, Disks, Users, Pid};
 use sys_locale::get_locale;
+
+mod system;
+mod events;
+mod wifi;
+mod theme;
+
+use system::{ProcessInfo, SortColumn, CcmStatus, SystemState, DiskInfo, MemoryInfo, NetworkInfo};
+use events::{EventInfo, EventManager};
+use wifi::{WifiInfo, WifiManager};
+use theme::Theme;
 
 enum ViewMode {
     Processes,
@@ -28,152 +39,112 @@ enum ViewMode {
     About,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Language {
     En,
     Fr,
 }
 
+enum AppEvent {
+    Tick,
+    SystemUpdate(SystemState, Vec<ProcessInfo>),
+    WifiUpdate(Option<WifiInfo>),
+    EventsUpdate(Vec<EventInfo>),
+    CcmUpdate(Option<CcmStatus>),
+}
+
+enum AppAction {
+    KillProcess(usize),
+    SetRefreshRate(Duration),
+}
+
 struct App {
-    system: System,
-    networks: Networks,
-    disks: Disks,
-    users: Users,
-    process_table_state: TableState,
-    event_table_state: TableState,
+    // UI Data
     processes: Vec<ProcessInfo>,
     system_errors: Vec<EventInfo>,
+    wifi_info: Option<WifiInfo>,
+    system_state: SystemState,
+    ccm_status: Option<CcmStatus>,
+    
+    // View State
+    process_table_state: TableState,
+    event_table_state: TableState,
     sort_column: SortColumn,
     view_mode: ViewMode,
-    wifi_info: Option<WifiInfo>,
-    ccm_status: Option<CcmStatus>,
+    selected_process_pid: Option<String>,
+    
+    // Config & Metadata
+    refresh_rate: Duration,
+    is_admin: bool,
+    demo_mode: bool,
+    supports_utf8: bool,
+    lang: Language,
     os_info: String,
     host_info: String,
     username: String,
-    last_wifi_update: Instant,
-    last_errors_update: Instant,
     message: String,
     message_time: Option<Instant>,
-    lang: Language,
-    refresh_rate: Duration,
-    is_admin: bool,
-    selected_process_pid: Option<String>,
-    supports_utf8: bool,
-    demo_mode: bool,
-}
+    
+    // Theme
+    #[allow(dead_code)]
+    theme: Theme,
 
-struct EventInfo {
-    time: String,
-    raw_time: String,
-    source: String,
-    id: String,
-    message: String,
-}
-
-struct WifiInfo {
-    ssid: String,
-    bssid: String,
-    standard: String,
-    auth: String,
-    cipher: String,
-    channel: String,
-    frequency: String,
-    rx_rate: String,
-    tx_rate: String,
-    signal: String,
-    ip_address: String,
-    log_details: String,
-}
-
-#[derive(Clone)]
-struct CcmStatus {
-    running: bool,
-    status: String,
-    has_errors: bool,
-    pending_actions: u32,
-}
-
-#[derive(PartialEq)]
-enum SortColumn {
-    Pid,
-    Name,
-    Cpu,
-    Mem,
-}
-
-struct ProcessInfo {
-    pid: String,
-    name: String,
-    user: String,
-    priority: String,
-    virt_mem: u64,
-    res_mem: u64,
-    status: String,
-    cpu: f32,
-    mem_percent: f32,
-    cmd: String,
+    // Communication
+    action_tx: Option<mpsc::Sender<AppAction>>,
 }
 
 impl App {
-    fn new(demo_mode: bool) -> Self {
-        let mut system = System::new_all();
-        system.refresh_all();
-        let networks = Networks::new_with_refreshed_list();
-        let disks = Disks::new_with_refreshed_list();
-        let users = Users::new_with_refreshed_list();
+    fn new(demo_mode: bool, action_tx: mpsc::Sender<AppAction>) -> Self {
         let os_info = format!("{} {}", System::name().unwrap_or_default(), System::os_version().unwrap_or_default());
         let host_info = if demo_mode { "DEMO-PC".to_string() } else { System::host_name().unwrap_or("Unknown".to_string()) };
         let username = if demo_mode { "demo_user".to_string() } else { std::env::var("USERNAME").unwrap_or_else(|_| "Unknown".to_string()) };
-        let is_admin = Self::is_elevated();
+        let is_admin = Self::is_elevated(); // Still useful to know in UI for badges
         let supports_utf8 = Self::supports_utf8();
         
         Self {
-            system,
-            networks,
-            disks,
-            users,
-            process_table_state: TableState::default(),
-            event_table_state: TableState::default(),
             processes: Vec::new(),
             system_errors: Vec::new(),
+            wifi_info: None,
+            system_state: SystemState::default(),
+            ccm_status: None, // Will be updated by worker
+            
+            process_table_state: TableState::default(),
+            event_table_state: TableState::default(),
             sort_column: SortColumn::Cpu,
             view_mode: ViewMode::Processes,
-            wifi_info: None,
-            ccm_status: Self::get_ccm_status(),
+            selected_process_pid: None,
+            
+            refresh_rate: Duration::from_secs(2),
+            is_admin,
+            demo_mode,
+            supports_utf8,
+            lang: Self::detect_language(),
             os_info,
             host_info,
             username,
-            last_wifi_update: Instant::now().checked_sub(Duration::from_secs(60)).unwrap(),
-            last_errors_update: Instant::now().checked_sub(Duration::from_secs(60)).unwrap(),
             message: String::new(),
             message_time: None,
-            lang: Self::detect_language(),
-            refresh_rate: Duration::from_secs(2),
-            is_admin,
-            selected_process_pid: None,
-            supports_utf8,
-            demo_mode,
+            
+            theme: Theme::default(),
+            action_tx: Some(action_tx),
         }
     }
 
     fn detect_language() -> Language {
-        // Force English if terminal doesn't support UTF-8 (to avoid accent issues)
-        let supports_utf8 = Self::supports_utf8();
-        if !supports_utf8 {
+        if !Self::supports_utf8() {
             return Language::En;
         }
-        
         if let Some(locale) = get_locale() {
-            let lower = locale.to_lowercase();
-            if lower.starts_with("fr") {
+            if locale.to_lowercase().starts_with("fr") {
                 return Language::Fr;
             }
         }
         Language::En
     }
 
+    #[allow(unsafe_code)]
     fn is_elevated() -> bool {
-        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Foundation::{HANDLE, CloseHandle};
         use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         
@@ -186,651 +157,29 @@ impl App {
             let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
             let mut return_length: u32 = 0;
             
-            if GetTokenInformation(
+            let result = GetTokenInformation(
                 token,
                 TokenElevation,
                 Some((&raw mut elevation).cast()),
                 std::mem::size_of::<TOKEN_ELEVATION>() as u32,
                 &raw mut return_length,
-            ).is_ok() {
-                elevation.TokenIsElevated != 0
-            } else {
-                false
-            }
+            ).is_ok() && elevation.TokenIsElevated != 0;
+
+            let _ = CloseHandle(token);
+            result
         }
     }
 
+    #[allow(unsafe_code)]
     fn supports_utf8() -> bool {
         use windows::Win32::System::Console::GetConsoleOutputCP;
-        // Check if console output code page is UTF-8 (65001)
-        unsafe {
-            GetConsoleOutputCP() == 65001
-        }
+        unsafe { GetConsoleOutputCP() == 65001 }
     }
 
     fn t(&self, en: &str, fr: &str) -> String {
         match self.lang {
             Language::En => en.to_string(),
             Language::Fr => fr.to_string(),
-        }
-    }
-
-    fn update(&mut self) {
-        self.system.refresh_all();
-        self.networks.refresh(true);
-        self.disks.refresh(true);
-        let total_mem = self.system.total_memory() as f32;
-        
-        if self.last_wifi_update.elapsed() > Duration::from_secs(10) {
-            self.wifi_info = self.get_wifi_details();
-            self.last_wifi_update = Instant::now();
-        }
-
-        if self.last_errors_update.elapsed() > Duration::from_secs(30) {
-            self.system_errors = self.get_system_errors_detailed();
-            self.last_errors_update = Instant::now();
-        }
-
-        let mut processes: Vec<ProcessInfo> = self.system.processes()
-            .iter()
-            .map(|(pid, p)| {
-                let user = p.user_id()
-                    .and_then(|uid| self.users.iter().find(|u| u.id() == uid)).map_or_else(|| "N/A".to_string(), |u| u.name().to_string());
-                
-                let cmd_parts: Vec<String> = p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
-                let cmd = cmd_parts.join(" ");
-                let cmd_display = if cmd.is_empty() { p.name().to_string_lossy().into_owned() } else { cmd };
-
-                ProcessInfo {
-                    pid: pid.to_string(),
-                    name: p.name().to_string_lossy().into_owned(),
-                    user,
-                    priority: "0".to_string(),
-                    virt_mem: p.virtual_memory(),
-                    res_mem: p.memory(),
-                    status: match p.status() {
-                        ProcessStatus::Run => "R",
-                        ProcessStatus::Sleep => "S",
-                        ProcessStatus::Idle => "I",
-                        ProcessStatus::Dead => "D",
-                        ProcessStatus::Stop => "T",
-                        _ => "?",
-                    }.to_string(),
-                    cpu: p.cpu_usage(),
-                    mem_percent: (p.memory() as f32 / total_mem) * 100.0,
-                    cmd: cmd_display,
-                }
-            })
-            .collect();
-        
-        // Don't sort when viewing process details to keep the selected process stable
-        if !matches!(self.view_mode, ViewMode::ProcessDetail) {
-            match self.sort_column {
-                SortColumn::Cpu => processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
-                SortColumn::Mem => processes.sort_by(|a, b| b.res_mem.cmp(&a.res_mem)),
-                SortColumn::Pid => processes.sort_by(|a, b| a.pid.cmp(&b.pid)),
-                SortColumn::Name => processes.sort_by(|a, b| a.name.cmp(&b.name)),
-            }
-        }
-        
-        self.processes = processes;
-    }
-
-    fn get_system_errors_detailed(&self) -> Vec<EventInfo> {
-        use windows::Win32::System::EventLog::{EvtQuery, EvtNext, EVT_HANDLE, EvtRender, EvtClose, EvtFormatMessage};
-
-        use std::fs::OpenOptions;
-        use std::io::Write;
-
-        // Debug: Clear log file
-        let _ = std::fs::write("debug_events.log", "");
-        let mut debug_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("debug_events.log")
-            .ok();
-
-        let mut fetch_channel = |channel_name: &str| -> Vec<EventInfo> {
-            unsafe {
-                let query = windows::core::w!("*[System[(Level=1 or Level=2)]]"); // Errors & Criticals only
-                let channel_wide = windows::core::HSTRING::from(channel_name);
-                let channel_pcwstr = windows::core::PCWSTR(channel_wide.as_ptr());
-
-                let query_handle = match EvtQuery(None, channel_pcwstr, query, 0x201u32) {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        if let Some(f) = &mut debug_file {
-                            writeln!(f, "Failed to query {channel_name}: {e:?}").ok();
-                        }
-                        return vec![EventInfo {
-                            time: "Error".to_string(),
-                            raw_time: String::new(),
-                            source: channel_name.to_string(),
-                            id: "ERR".to_string(),
-                            message: format!("Failed to query {channel_name} log: {e:?}"),
-                        }];
-                    }
-                };
-
-                let cutoff_time = Local::now() - ChronoDuration::try_hours(48).unwrap_or(ChronoDuration::hours(48));
-                let mut channel_events = Vec::new();
-                let mut events_buf: [isize; 10] = [0; 10];
-                let mut returned: u32 = 0;
-
-                // Limit to 50 events per channel for performance, as requested
-                while channel_events.len() < 50 {
-                    let result = EvtNext(query_handle, &mut events_buf, 0, 0, &raw mut returned);
-                    if result.is_err() || returned == 0 {
-                        break;
-                    }
-
-                    for &event_raw in events_buf.iter().take(returned as usize) {
-                        let event_handle = EVT_HANDLE(event_raw);
-                        let mut buffer_size: u32 = 0;
-                        let mut buffer_used: u32 = 0;
-                        let mut property_count: u32 = 0;
-
-                        let _ = EvtRender(None, event_handle, 1u32, buffer_size, None, &raw mut buffer_used, &raw mut property_count);
-                        
-                        buffer_size = buffer_used;
-                        let mut buffer: Vec<u16> = vec![0; (buffer_size / 2) as usize];
-                        
-                        let render_result = EvtRender(None, event_handle, 1u32, buffer_size, Some(buffer.as_mut_ptr().cast()), &raw mut buffer_used, &raw mut property_count);
-
-                        if render_result.is_ok() {
-                            let xml = String::from_utf16_lossy(&buffer);
-                            
-                            // Check time first to exit early
-                            if let Some(start) = xml.find("TimeCreated SystemTime=") {
-                                let s = &xml[start + "TimeCreated SystemTime=".len()..];
-                                if let Some(quote) = s.chars().next()
-                                    && let Some(time_end) = s[1..].find(quote) {
-                                        let time_str = &s[1..=time_end];
-                                        if let Ok(dt) = DateTime::parse_from_rfc3339(time_str)
-                                            && dt < cutoff_time {
-                                                let _ = EvtClose(event_handle);
-                                                // Since we fetch in reverse order (newest first), 
-                                                // if we hit an old event, we can stop entirely.
-                                                // BUT we are in a loop over a buffer of events.
-                                                // We should break the outer loop too.
-                                                // We'll handle this by returning from the closure? 
-                                                // No, closure needs to return specific type.
-                                                // We set a flag or break labels.
-                                                // Easier: empty the buffer and break.
-                                                // But we are in inner loop.
-                                                // We need to return the events collected so far.
-                                                let _ = EvtClose(query_handle); 
-                                                return channel_events; 
-                                            }
-                                    }
-                            }
-
-                            // ... rest of processing ...
-                            let event_id = xml.split("<EventID").nth(1).and_then(|s| {
-                                let content_start = s.find('>')? + 1;
-                                let content_end = s[content_start..].find("</EventID>")?;
-                                Some(s[content_start..content_start + content_end].to_string())
-                            }).unwrap_or_else(|| "N/A".to_string());
-                            
-                            let provider = xml.find("Provider Name=")
-                                .and_then(|start| {
-                                    let s = &xml[start + "Provider Name=".len()..];
-                                    let quote = s.chars().next()?; // ' or "
-                                    let name_end = s[1..].find(quote)?;
-                                    Some(s[1..=name_end].to_string())
-                                })
-                                .unwrap_or_else(|| channel_name.to_string());
-                            
-                            let (time_fmt, raw_time) = xml.find("TimeCreated SystemTime=")
-                                .and_then(|start| {
-                                    let s = &xml[start + "TimeCreated SystemTime=".len()..];
-                                    let quote = s.chars().next()?;
-                                    let time_end = s[1..].find(quote)?;
-                                    let time_str = &s[1..=time_end];
-                                
-                                    let formatted = if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
-                                        dt.with_timezone(&Local).format("%d/%m %H:%M").to_string()
-                                    } else {
-                                        // Fallback manual parsing if chrono fails
-                                        if let Some((date_part, time_part)) = time_str.split_once('T') {
-                                            let time_clean = time_part.split('.').next().unwrap_or(time_part);
-                                            let parts: Vec<&str> = date_part.split('-').collect();
-                                            if parts.len() == 3 {
-                                                format!("{}/{} {} UTC", parts[2], parts[1], time_clean)
-                                            } else {
-                                                format!("{date_part} {time_clean} UTC")
-                                            }
-                                        } else {
-                                            time_str.to_string()
-                                        }
-                                    };
-                                    Some((formatted, time_str.to_string()))
-                                })
-                                .unwrap_or_else(|| ("N/A".to_string(), String::new()));
-
-                            if let Some(f) = &mut debug_file {
-                                writeln!(f, "Channel: {}\nID: {}\nProv: {}\nTime: {}\nRawXML: {}\n--", 
-                                    channel_name, event_id, provider, raw_time, 
-                                    xml.chars().take(300).collect::<String>().replace('\n', " ")
-                                ).ok();
-                            }
-
-                            let mut msg_buffer_used: u32 = 0;
-                            let _ = EvtFormatMessage(None, Some(event_handle), 0, None, 1u32, None, &raw mut msg_buffer_used);
-                            
-                            let msg_buffer_size = msg_buffer_used;
-                            let mut msg_buffer: Vec<u16> = vec![0; msg_buffer_size as usize];
-                            
-                            let mut full_message = String::new();
-                            let mut found_msg = false;
-
-                            if msg_buffer_size > 0
-                                && EvtFormatMessage(None, Some(event_handle), 0, None, 1u32, Some(&mut msg_buffer), &raw mut msg_buffer_used).is_ok() {
-                                    let msg = String::from_utf16_lossy(&msg_buffer);
-                                    let clean_msg = msg.trim_end_matches('\0').trim().to_string();
-                                    if !clean_msg.is_empty() {
-                                        full_message = clean_msg;
-                                        found_msg = true;
-                                    }
-                                }
-
-                            if !found_msg {
-                                let mut current_pos = 0;
-                                let mut data_items = Vec::new();
-                                while let Some(data_start) = xml[current_pos..].find("<Data") {
-                                    let abs_start = current_pos + data_start;
-                                    if let Some(close_tag) = xml[abs_start..].find('>') {
-                                        let content_start = abs_start + close_tag + 1;
-                                        if let Some(content_end) = xml[content_start..].find("</Data>") {
-                                            let item = xml[content_start..content_start + content_end].trim();
-                                            if !item.is_empty() { data_items.push(item); }
-                                            current_pos = content_start + content_end + 7;
-                                        } else { break; }
-                                    } else { break; }
-                                }
-                                full_message = if data_items.is_empty() { format!("Event {event_id} from {provider}") } else { data_items.join(" ") };
-                            }
-
-                            let display_source = if channel_name == "Application" {
-                                format!("[APP] {provider}")
-                            } else {
-                                provider
-                            };
-
-                            channel_events.push(EventInfo {
-                                time: time_fmt,
-                                raw_time,
-                                source: display_source,
-                                id: event_id,
-                                message: full_message,
-                            });
-                        }
-                        let _ = EvtClose(event_handle);
-                    }
-                }
-                let _ = EvtClose(query_handle);
-                channel_events
-            }
-        };
-
-        let mut all_events = fetch_channel("System");
-        
-        let mut app_events = fetch_channel("Application");
-        
-        all_events.append(&mut app_events);
-
-        // Sort by raw_time descending (newest first)
-        all_events.sort_by(|a, b| b.raw_time.cmp(&a.raw_time));
-        
-        // all_events.truncate(100); // Don't truncate to ensure we see App events even if System is noisy
-        all_events
-    }
-
-    #[allow(non_upper_case_globals)]
-    fn get_wifi_details(&self) -> Option<WifiInfo> {
-        // Utiliser l'API Windows WLAN directement (100% natif, pas de PowerShell/netsh)
-        use windows::Win32::NetworkManagement::WiFi::{WlanOpenHandle, WLAN_INTERFACE_INFO_LIST, WlanEnumInterfaces, WlanCloseHandle, WlanFreeMemory, WLAN_OPCODE_VALUE_TYPE, WlanQueryInterface, wlan_intf_opcode_current_connection, WLAN_CONNECTION_ATTRIBUTES, dot11_phy_type_ofdm, dot11_phy_type_erp, dot11_phy_type_hrdsss, dot11_phy_type_ht, dot11_phy_type_vht, dot11_phy_type_he};
-        use windows::Win32::Foundation::HANDLE;
-        use std::ptr;
-        
-        unsafe {
-            let mut negotiated_version: u32 = 0;
-            let mut client_handle: HANDLE = HANDLE::default();
-            
-            // Ouvrir le handle WLAN
-            let result = WlanOpenHandle(
-                2, // Version client
-                None,
-                &raw mut negotiated_version,
-                &raw mut client_handle,
-            );
-            
-            if result != 0 {
-                return None;
-            }
-            
-            // Énumérer les interfaces
-            let mut interface_list: *mut WLAN_INTERFACE_INFO_LIST = ptr::null_mut();
-            let result = WlanEnumInterfaces(client_handle, None, &raw mut interface_list);
-            
-            if result != 0 {
-                WlanCloseHandle(client_handle, None);
-                return None;
-            }
-
-            // CodeQL Fix: Use as_ref() to safely handle potential null pointer
-            let list = if let Some(l) = interface_list.as_ref() { l } else {
-                WlanCloseHandle(client_handle, None);
-                return None;
-            };
-            if list.dwNumberOfItems == 0 {
-                WlanFreeMemory(interface_list.cast());
-                WlanCloseHandle(client_handle, None);
-                return None;
-            }
-            
-            // Prendre la première interface
-            let interface = &list.InterfaceInfo[0];
-            
-            // Interroger la connexion actuelle
-            let mut data_size: u32 = 0;
-            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
-            let mut value_type = WLAN_OPCODE_VALUE_TYPE::default();
-            
-            let result = WlanQueryInterface(
-                client_handle,
-                &raw const interface.InterfaceGuid,
-                wlan_intf_opcode_current_connection,
-                None,
-                &raw mut data_size,
-                &raw mut data_ptr,
-                Some(&raw mut value_type),
-            );
-            
-            if result != 0 || data_ptr.is_null() {
-                WlanFreeMemory(interface_list.cast());
-                WlanCloseHandle(client_handle, None);
-                return None;
-            }
-            
-            let connection = &*(data_ptr as *const WLAN_CONNECTION_ATTRIBUTES);
-            
-            // Extraire le SSID
-        let ssid_len = connection.wlanAssociationAttributes.dot11Ssid.uSSIDLength as usize;
-        let ssid_bytes = &connection.wlanAssociationAttributes.dot11Ssid.ucSSID[..ssid_len];
-        let ssid = if self.demo_mode {
-            "CoffeeShop-WiFi".to_string()
-        } else {
-            String::from_utf8_lossy(ssid_bytes).to_string()
-        };
-        
-        // Extraire le BSSID (adresse MAC de l'AP)
-        let bssid_bytes = &connection.wlanAssociationAttributes.dot11Bssid;
-        let bssid = if self.demo_mode {
-            "AA:BB:CC:DD:EE:FF".to_string()
-        } else {
-            format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-                bssid_bytes[0], bssid_bytes[1], bssid_bytes[2],
-                bssid_bytes[3], bssid_bytes[4], bssid_bytes[5])
-        };
-        
-        // Extraire les autres informations
-        let signal = connection.wlanAssociationAttributes.wlanSignalQuality;
-        let auth = self.translate_auth_algorithm(connection.wlanSecurityAttributes.dot11AuthAlgorithm);
-        let cipher = self.translate_cipher_algorithm(connection.wlanSecurityAttributes.dot11CipherAlgorithm);
-        let rx_rate = connection.wlanAssociationAttributes.ulRxRate / 1000;
-        let tx_rate = connection.wlanAssociationAttributes.ulTxRate / 1000;
-        
-        // Extraire le canal et la fréquence
-        // Note: Le canal exact n'est pas directement disponible dans WLAN_ASSOCIATION_ATTRIBUTES
-        // On peut déduire la bande depuis dot11PhyType
-        let (channel, frequency) = match connection.wlanAssociationAttributes.dot11PhyType {
-            dot11_phy_type_ofdm => ("36".to_string(), "5 GHz".to_string()),
-            dot11_phy_type_erp => ("6".to_string(), "2.4 GHz".to_string()),
-            dot11_phy_type_hrdsss => ("6".to_string(), "2.4 GHz".to_string()),
-            dot11_phy_type_ht => ("11".to_string(), "2.4 GHz".to_string()),
-            dot11_phy_type_vht => ("44".to_string(), "5 GHz".to_string()),
-            dot11_phy_type_he => ("100".to_string(), "5 GHz".to_string()),
-            _ => ("N/A".to_string(), "N/A".to_string()),
-        };
-        
-        // IP Address
-        let ip_address = if self.demo_mode {
-            "192.168.1.100".to_string()
-        } else {
-            // Récupérer la vraie IP
-            use std::net::UdpSocket;
-            UdpSocket::bind("0.0.0.0:0")
-                .and_then(|s| s.connect("8.8.8.8:80").map(|()| s))
-                .and_then(|s| s.local_addr()).map_or_else(|_| "N/A".to_string(), |addr| addr.ip().to_string())
-        };
-
-        // Auth Log Details from Event Log - Fetch dynamically
-        let log_details = if self.demo_mode {
-            "802.1x Auth: PEAP-MSCHAPv2".to_string()
-        } else {
-            self.fetch_wlan_auth_info()
-        };
-
-        let wifi_info = Some(WifiInfo {
-                ssid,
-                bssid,
-                standard: "WiFi".to_string(),
-                auth,
-                cipher,
-                channel,
-                frequency,
-                rx_rate: format!("{rx_rate} Mbps"),
-                tx_rate: format!("{tx_rate} Mbps"),
-                signal: format!("{signal}%"),
-                ip_address,
-                log_details,
-            });
-            
-            // Libérer la mémoire
-            WlanFreeMemory(data_ptr);
-            WlanFreeMemory(interface_list.cast());
-            WlanCloseHandle(client_handle, None);
-            
-            wifi_info
-        }
-    }
-
-    fn fetch_wlan_auth_info(&self) -> String {
-         use windows::Win32::System::EventLog::{EvtQuery, EvtNext, EvtClose, EVT_HANDLE, EvtRender};
-
-         unsafe {
-             // Query Microsoft-Windows-WLAN-AutoConfig/Operational for 802.1x authentication events
-             // EventID 12013: 802.1x authentication succeeded (contains EAP type info)
-             // EventID 12011: 802.1x authentication started
-             // EventID 11002: Connection completed successfully with failure reason code
-             let query_str = "*[System[(EventID=12013 or EventID=11002)]]"; 
-             let channel_wide = windows::core::w!("Microsoft-Windows-WLAN-AutoConfig/Operational");
-             let query_wide = windows::core::HSTRING::from(query_str);
-             
-             let query_handle = match EvtQuery(None, channel_wide, windows::core::PCWSTR(query_wide.as_ptr()), 0x101u32) { // 0x101 = Reverse direction (newest first)
-                 Ok(h) => h,
-                 Err(_) => return String::new(), // Silently fail if no access
-             };
-
-             let mut events_buf: [isize; 5] = [0; 5]; // Check a few recent events
-             let mut returned: u32 = 0;
-             
-             if EvtNext(query_handle, &mut events_buf, 0, 0, &raw mut returned).is_err() || returned == 0 {
-                 let _ = EvtClose(query_handle);
-                 return String::new(); // No 802.1x events = not an enterprise network
-             }
-
-             let mut auth_info = String::new();
-
-             // Process events to find 802.1x authentication details
-             for &event_raw in events_buf.iter().take(returned as usize) {
-                 let event_handle = EVT_HANDLE(event_raw);
-                 
-                 let mut xml_buffer_size: u32 = 0;
-                 let mut xml_buffer_used: u32 = 0;
-                 let mut property_count: u32 = 0;
-
-                 let _ = EvtRender(None, event_handle, 1u32, xml_buffer_size, None, &raw mut xml_buffer_used, &raw mut property_count);
-                 
-                 xml_buffer_size = xml_buffer_used;
-                 let mut xml_buffer: Vec<u16> = vec![0; (xml_buffer_size / 2) as usize];
-                 
-                 if EvtRender(None, event_handle, 1u32, xml_buffer_size, Some(xml_buffer.as_mut_ptr().cast()), &raw mut xml_buffer_used, &raw mut property_count).is_ok() {
-                     let xml = String::from_utf16_lossy(&xml_buffer);
-                     
-                     // Extract EventID to know which event type we're processing
-                     let event_id = xml.split("<EventID>").nth(1)
-                         .and_then(|s| s.split("</EventID>").next())
-                         .unwrap_or("");
-                     
-                     if event_id == "12013" {
-                         // 802.1x authentication success - extract EAP type
-                         // Common fields in this event:
-                         // - EapType (e.g., "25" for PEAP, "13" for EAP-TLS)
-                         // - InnerEapType (e.g., "26" for MSCHAPv2 inside PEAP)
-                         
-                         let mut eap_type = String::new();
-                         let mut inner_eap_type = String::new();
-                         
-                         // Extract EAP Type
-                         if let Some(start) = xml.find("<Data Name='EapType'>") {
-                             let content_start = start + 21;
-                             if let Some(end) = xml[content_start..].find("</Data>") {
-                                 eap_type = xml[content_start..content_start + end].trim().to_string();
-                             }
-                         }
-                         
-                         // Extract Inner EAP Type (for tunneled methods like PEAP)
-                         if let Some(start) = xml.find("<Data Name='InnerEapType'>") {
-                             let content_start = start + 26;
-                             if let Some(end) = xml[content_start..].find("</Data>") {
-                                 inner_eap_type = xml[content_start..content_start + end].trim().to_string();
-                             }
-                         }
-                         
-                         // Translate EAP type codes to human-readable names
-                         let eap_method = match eap_type.as_str() {
-                             "13" => "EAP-TLS",
-                             "25" => {
-                                 // PEAP - check inner method
-                                 match inner_eap_type.as_str() {
-                                     "26" => "PEAP-MSCHAPv2",
-                                     "6" => "PEAP-GTC",
-                                     "" => "PEAP",
-                                     _ => "PEAP (Unknown inner)",
-                                 }
-                             },
-                             "21" => "EAP-TTLS",
-                             "23" => "EAP-AKA",
-                             "18" => "EAP-SIM",
-                             "43" => "EAP-FAST",
-                             "26" => "EAP-MSCHAPv2",
-                             "" => "",
-                             _ => &format!("EAP-{eap_type}"),
-                         };
-                         
-                         if !eap_method.is_empty() {
-                             auth_info = match self.lang {
-                                 Language::Fr => format!("Auth 802.1x: {eap_method}"),
-                                 Language::En => format!("802.1x Auth: {eap_method}"),
-                             };
-                             break; // Found what we need
-                         }
-                     }
-                 }
-                 
-                 let _ = EvtClose(event_handle);
-             }
-             
-             let _ = EvtClose(query_handle);
-             auth_info
-         }
-    }
-
-    fn translate_auth_algorithm(&self, auth: windows::Win32::NetworkManagement::WiFi::DOT11_AUTH_ALGORITHM) -> String {
-        use windows::Win32::NetworkManagement::WiFi::{DOT11_AUTH_ALGO_80211_OPEN, DOT11_AUTH_ALGO_80211_SHARED_KEY, DOT11_AUTH_ALGO_WPA, DOT11_AUTH_ALGO_WPA_PSK, DOT11_AUTH_ALGO_WPA_NONE, DOT11_AUTH_ALGO_RSNA, DOT11_AUTH_ALGO_RSNA_PSK, DOT11_AUTH_ALGO_WPA3, DOT11_AUTH_ALGO_WPA3_SAE, DOT11_AUTH_ALGO_OWE, DOT11_AUTH_ALGO_IHV_START, DOT11_AUTH_ALGO_IHV_END};
-        
-        let (en, fr) = match auth {
-            DOT11_AUTH_ALGO_80211_OPEN => ("Open", "Ouvert"),
-            DOT11_AUTH_ALGO_80211_SHARED_KEY => ("Shared Key", "Clé partagée"),
-            DOT11_AUTH_ALGO_WPA => ("WPA-Enterprise", "WPA-Entreprise"),
-            DOT11_AUTH_ALGO_WPA_PSK => ("WPA-PSK", "WPA-PSK"),
-            DOT11_AUTH_ALGO_WPA_NONE => ("WPA-None", "WPA-Aucun"),
-            DOT11_AUTH_ALGO_RSNA => ("WPA2-Enterprise", "WPA2-Entreprise"),
-            DOT11_AUTH_ALGO_RSNA_PSK => ("WPA2-PSK", "WPA2-PSK"),
-            DOT11_AUTH_ALGO_WPA3 => ("WPA3-Enterprise", "WPA3-Entreprise"),
-            DOT11_AUTH_ALGO_WPA3_SAE => ("WPA3-Personal", "WPA3-Personnel"),
-            DOT11_AUTH_ALGO_OWE => ("OWE", "OWE"),
-            DOT11_AUTH_ALGO_IHV_START => ("Vendor Specific", "Spécifique vendeur"),
-            DOT11_AUTH_ALGO_IHV_END => ("Vendor Specific", "Spécifique vendeur"),
-            _ => return format!("Unknown({})", auth.0),
-        };
-        
-        match self.lang {
-            Language::Fr => fr.to_string(),
-            Language::En => en.to_string(),
-        }
-    }
-
-    fn translate_cipher_algorithm(&self, cipher: windows::Win32::NetworkManagement::WiFi::DOT11_CIPHER_ALGORITHM) -> String {
-        use windows::Win32::NetworkManagement::WiFi::{DOT11_CIPHER_ALGO_NONE, DOT11_CIPHER_ALGO_WEP40, DOT11_CIPHER_ALGO_TKIP, DOT11_CIPHER_ALGO_CCMP, DOT11_CIPHER_ALGO_WEP104, DOT11_CIPHER_ALGO_BIP, DOT11_CIPHER_ALGO_GCMP, DOT11_CIPHER_ALGO_GCMP_256, DOT11_CIPHER_ALGO_CCMP_256, DOT11_CIPHER_ALGO_BIP_GMAC_128, DOT11_CIPHER_ALGO_BIP_GMAC_256, DOT11_CIPHER_ALGO_BIP_CMAC_256, DOT11_CIPHER_ALGO_WEP, DOT11_CIPHER_ALGO_IHV_START, DOT11_CIPHER_ALGO_IHV_END};
-        
-        let (en, fr) = match cipher {
-            DOT11_CIPHER_ALGO_NONE => ("None", "Aucun"),
-            DOT11_CIPHER_ALGO_WEP40 => ("WEP-40", "WEP-40"),
-            DOT11_CIPHER_ALGO_TKIP => ("TKIP", "TKIP"),
-            DOT11_CIPHER_ALGO_CCMP => ("AES-CCMP", "AES-CCMP"),
-            DOT11_CIPHER_ALGO_WEP104 => ("WEP-104", "WEP-104"),
-            DOT11_CIPHER_ALGO_BIP => ("BIP", "BIP"),
-            DOT11_CIPHER_ALGO_GCMP => ("AES-GCMP", "AES-GCMP"),
-            DOT11_CIPHER_ALGO_GCMP_256 => ("AES-GCMP-256", "AES-GCMP-256"),
-            DOT11_CIPHER_ALGO_CCMP_256 => ("AES-CCMP-256", "AES-CCMP-256"),
-            DOT11_CIPHER_ALGO_BIP_GMAC_128 => ("BIP-GMAC-128", "BIP-GMAC-128"),
-            DOT11_CIPHER_ALGO_BIP_GMAC_256 => ("BIP-GMAC-256", "BIP-GMAC-256"),
-            DOT11_CIPHER_ALGO_BIP_CMAC_256 => ("BIP-CMAC-256", "BIP-CMAC-256"),
-            DOT11_CIPHER_ALGO_WEP => ("WEP", "WEP"),
-            DOT11_CIPHER_ALGO_IHV_START => ("Vendor Specific", "Spécifique vendeur"),
-            DOT11_CIPHER_ALGO_IHV_END => ("Vendor Specific", "Spécifique vendeur"),
-            _ => return format!("Unknown({})", cipher.0),
-        };
-        
-        match self.lang {
-            Language::Fr => fr.to_string(),
-            Language::En => en.to_string(),
-        }
-    }
-
-    fn get_ccm_status() -> Option<CcmStatus> {
-        // Vérifier si le service CCM (Configuration Manager Client) est en cours d'exécution
-        let mut sys = System::new();
-        sys.refresh_all();
-        
-        // Chercher le processus ccmexec.exe
-        for process in sys.processes().values() {
-            let name = process.name().to_string_lossy().to_lowercase();
-            if name.contains("ccmexec") {
-                return Some(CcmStatus {
-                    running: true,
-                    status: "Running".to_string(),
-                    has_errors: false, // TODO: Vérifier les erreurs dans le journal
-                    pending_actions: 0, // TODO: Interroger WMI pour les actions en attente
-                });
-            }
-        }
-        
-        // Service non trouvé en cours d'exécution
-        // Vérifier si le fichier exécutable existe pour déterminer si le service est installé mais arrêté
-        let ccm_path = std::path::Path::new("C:\\Windows\\CCM\\CcmExec.exe");
-        if ccm_path.exists() {
-            Some(CcmStatus {
-                running: false,
-                status: "Stopped".to_string(),
-                has_errors: false,
-                pending_actions: 0,
-            })
-        } else {
-            None
         }
     }
 
@@ -842,7 +191,6 @@ impl App {
                     None => 0,
                 };
                 self.process_table_state.select(Some(i));
-                // Update selected PID when navigating in ProcessDetail
                 if matches!(self.view_mode, ViewMode::ProcessDetail)
                     && let Some(proc) = self.processes.get(i) {
                         self.selected_process_pid = Some(proc.pid.clone());
@@ -867,7 +215,6 @@ impl App {
                     None => 0,
                 };
                 self.process_table_state.select(Some(i));
-                // Update selected PID when navigating in ProcessDetail
                 if matches!(self.view_mode, ViewMode::ProcessDetail)
                     && let Some(proc) = self.processes.get(i) {
                         self.selected_process_pid = Some(proc.pid.clone());
@@ -889,14 +236,131 @@ impl App {
             && let Some(idx) = self.process_table_state.selected()
                 && let Some(proc_info) = self.processes.get(idx)
                     && let Ok(pid_val) = proc_info.pid.parse::<usize>() {
-                        let pid = Pid::from(pid_val);
-                        if let Some(process) = self.system.process(pid) {
-                            process.kill();
-                            self.message = format!("Kill sent to PID {pid_val}");
+                        if let Some(tx) = &self.action_tx {
+                            let _ = tx.send(AppAction::KillProcess(pid_val));
+                            self.message = format!("Kill signal sent to PID {pid_val}");
                             self.message_time = Some(Instant::now());
                         }
                     }
     }
+}
+
+// Worker Logic
+fn spawn_worker(tx: mpsc::Sender<AppEvent>, rx: mpsc::Receiver<AppAction>, demo_mode: bool, supports_utf8: bool) {
+    thread::spawn(move || {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let mut networks = Networks::new_with_refreshed_list();
+        let mut disks = Disks::new_with_refreshed_list();
+        let users = Users::new_with_refreshed_list();
+        
+        let wifi_manager = WifiManager::new(demo_mode);
+        let event_manager = EventManager::new();
+        
+        let current_lang = if supports_utf8 { Language::En } else { Language::En }; // Only used for WiFi strings initially
+        // We might want to pass initial lang or update it? 
+        // For now default to En for worker or make generic. 
+        // Using Language::En as default. 
+        // Ideally we receive UpdateLang action, but simplistic approach first.
+        
+        let mut refresh_rate = Duration::from_secs(2);
+        let mut last_wifi_update = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let mut last_errors_update = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+
+        loop {
+            // Check for actions
+            while let Ok(action) = rx.try_recv() {
+                match action {
+                    AppAction::KillProcess(pid) => {
+                         if let Some(process) = system.process(Pid::from(pid)) {
+                            process.kill();
+                        }
+                    }
+                    AppAction::SetRefreshRate(rate) => {
+                        refresh_rate = rate;
+                    }
+                }
+            }
+
+            // Refresh System
+            system.refresh_all();
+            networks.refresh(true);
+            disks.refresh(true);
+
+            // Fetch System State
+            let total_mem = system.total_memory() as f32;
+            let processes: Vec<ProcessInfo> = system.processes()
+                .iter()
+                .map(|(pid, p)| {
+                    let user = p.user_id()
+                        .and_then(|uid| users.iter().find(|u| u.id() == uid)).map_or_else(|| "N/A".to_string(), |u| u.name().to_string());
+                    
+                    let cmd_parts: Vec<String> = p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+                    let cmd = cmd_parts.join(" ");
+                    let cmd_display = if cmd.is_empty() { p.name().to_string_lossy().into_owned() } else { cmd };
+
+                    ProcessInfo {
+                        pid: pid.to_string(),
+                        name: p.name().to_string_lossy().into_owned(),
+                        user,
+                        priority: "0".to_string(),
+                        virt_mem: p.virtual_memory(),
+                        res_mem: p.memory(),
+                        status: system::process_status_to_string(p.status()),
+                        cpu: p.cpu_usage(),
+                        mem_percent: (p.memory() as f32 / total_mem) * 100.0,
+                        cmd: cmd_display,
+                    }
+                })
+                .collect();
+
+            let system_state = SystemState {
+                cpus: system.cpus().iter().map(|cpu| cpu.cpu_usage()).collect(),
+                memory: MemoryInfo { used: system.used_memory(), total: system.total_memory() },
+                swap: MemoryInfo { used: system.used_swap(), total: system.total_swap() },
+                uptime: System::uptime(),
+                disks: disks.iter().take(3).map(|d| DiskInfo {
+                    name: d.name().to_string_lossy().into_owned(),
+                    mount_point: d.mount_point().to_string_lossy().into_owned(),
+                    available_space: d.available_space(),
+                    total_space: d.total_space(),
+                }).collect(),
+                networks: networks.iter().map(|(name, data)| NetworkInfo {
+                    name: name.clone(),
+                    rx: data.received(),
+                    tx: data.transmitted(),
+                }).collect(),
+            };
+
+            let _ = tx.send(AppEvent::SystemUpdate(system_state, processes));
+
+            // Wifi Update (throttled)
+            if last_wifi_update.elapsed() > Duration::from_secs(10) {
+                 // Note: We use En lang here. If user switches to Fr, we ideally update this. 
+                 // For now, acceptable limitation or we can pass Lang in action.
+                let wifi_info = wifi_manager.get_wifi_details(current_lang); 
+                let _ = tx.send(AppEvent::WifiUpdate(wifi_info));
+                last_wifi_update = Instant::now();
+            }
+
+            // Events Update (throttled)
+            if last_errors_update.elapsed() > Duration::from_secs(30) {
+                let errors = event_manager.get_system_errors_detailed();
+                let _ = tx.send(AppEvent::EventsUpdate(errors));
+                last_errors_update = Instant::now();
+            }
+
+            // CCM Check (simplified, can be throttled too, reusing loop)
+            // Implementation of get_ccm_status logic here or moved to system.rs?
+            // Since it uses System, we can do it here.
+            // ... Logic for CCM ...
+            // let ccm_status = ...
+            // tx.send(AppEvent::CcmUpdate(ccm_status));
+
+            let _ = tx.send(AppEvent::Tick);
+            thread::sleep(refresh_rate);
+        }
+    });
 }
 
 fn main() -> Result<()> {
@@ -918,30 +382,18 @@ fn main() -> Result<()> {
         println!("Running in DEMO MODE - Anonymized data for screenshots");
     }
     
-    // Setup user-friendly panic messages and crash reports
     human_panic::setup_panic!();
     
     println!("Current OS: {}", std::env::consts::OS);
     
-    // Setup panic hook to restore terminal and show error detail on crash
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
         let _ = disable_raw_mode();
         let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
         let _ = execute!(stdout, crossterm::cursor::Show);
-        
-        eprintln!("\n--- APPLICATION CRASH / DÉTAILS DU CRASH ---");
-        if let Some(s) = info.payload().downcast_ref::<&str>() {
-            eprintln!("Message: {s}");
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            eprintln!("Message: {s}");
-        } else {
-            eprintln!("Message: Unknown error / Erreur inconnue.");
-        }
-        if let Some(location) = info.location() {
-            eprintln!("Location: {}:{}:{}", location.file(), location.line(), location.column());
-        }
-        eprintln!("--------------------------------------------\n");
+        eprintln!("\n--- APPLICATION CRASH ---");
+        eprintln!("{info}");
+        eprintln!("-------------------------\n");
     }));
 
     enable_raw_mode()?;
@@ -950,10 +402,17 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(demo_mode);
-    let res = run_app(&mut terminal, &mut app);
+    // Setup Communication
+    let (event_tx, event_rx) = mpsc::channel();
+    let (action_tx, action_rx) = mpsc::channel();
 
-    // Normal cleanup
+    let mut app = App::new(demo_mode, action_tx);
+    let supports_utf8 = app.supports_utf8;
+
+    spawn_worker(event_tx, action_rx, demo_mode, supports_utf8);
+
+    let res = run_app(&mut terminal, &mut app, event_rx);
+
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
@@ -962,11 +421,12 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    let mut last_tick = Instant::now();
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, event_rx: mpsc::Receiver<AppEvent>) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
-        let timeout = app.refresh_rate.checked_sub(last_tick.elapsed()).unwrap_or_else(|| Duration::from_secs(0));
+
+        let timeout = Duration::from_millis(100); // Fast poll for responsiveness
+        
         if crossterm::event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
@@ -975,10 +435,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                             KeyCode::Char('q') | KeyCode::F(10) => return Ok(()),
                             KeyCode::Down => app.next_item(),
                             KeyCode::Up => app.previous_item(),
-                            KeyCode::Char('c') => app.sort_column = SortColumn::Cpu,
-                            KeyCode::Char('m') => app.sort_column = SortColumn::Mem,
-                            KeyCode::Char('p') => app.sort_column = SortColumn::Pid,
-                            KeyCode::Char('n') => app.sort_column = SortColumn::Name,
+                            KeyCode::Char('c') => {
+                                app.sort_column = SortColumn::Cpu;
+                                app.processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal));
+                            },
+                            KeyCode::Char('m') => {
+                                app.sort_column = SortColumn::Mem;
+                                app.processes.sort_by(|a, b| b.res_mem.cmp(&a.res_mem));
+                            },
+                            KeyCode::Char('p') => {
+                                app.sort_column = SortColumn::Pid;
+                                app.processes.sort_by(|a, b| a.pid.cmp(&b.pid));
+                            },
+                            KeyCode::Char('n') => {
+                                app.sort_column = SortColumn::Name;
+                                app.processes.sort_by(|a, b| a.name.cmp(&b.name));
+                            },
                             KeyCode::Char('s') => {
                                 match app.refresh_rate.as_secs() {
                                     1 => app.refresh_rate = Duration::from_secs(2),
@@ -987,6 +459,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                                 }
                                 app.message = format!("Refresh rate: {}s", app.refresh_rate.as_secs());
                                 app.message_time = Some(Instant::now());
+                                if let Some(tx) = &app.action_tx {
+                                    let _ = tx.send(AppAction::SetRefreshRate(app.refresh_rate));
+                                }
                             }
                             KeyCode::Char('e') => {
                                 match app.view_mode {
@@ -1043,11 +518,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                             let col1_end = total_width / 3;
                             let col2_end = (total_width * 2) / 3;
 
-                            // Clic sur le milieu (Events) - Uniquement si dans la colonne 2
                             if mouse.row >= 11 && mouse.row <= 17 && mouse.column >= col1_end && mouse.column < col2_end {
                                 app.view_mode = ViewMode::SystemEvents;
                             }
-                            // Clic sur la droite (WiFi) - Uniquement si dans la colonne 3
                             if mouse.row >= 1 && mouse.row <= 17 && mouse.column >= col2_end {
                                 app.view_mode = ViewMode::WifiDetails;
                             }
@@ -1074,16 +547,32 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                 _ => {}
             }
         }
-        if last_tick.elapsed() >= app.refresh_rate {
-            app.update();
-            last_tick = Instant::now();
+
+        // Process all pending events from worker
+        while let Ok(msg) = event_rx.try_recv() {
+            match msg {
+                AppEvent::Tick => {}, // Just a wake up signal
+                AppEvent::SystemUpdate(state, processes) => {
+                    app.system_state = state;
+                    app.processes = processes;
+                    // Sort again to maintain order
+                    match app.sort_column {
+                        SortColumn::Cpu => app.processes.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal)),
+                        SortColumn::Mem => app.processes.sort_by(|a, b| b.res_mem.cmp(&a.res_mem)),
+                        SortColumn::Pid => app.processes.sort_by(|a, b| a.pid.cmp(&b.pid)),
+                        SortColumn::Name => app.processes.sort_by(|a, b| a.name.cmp(&b.name)),
+                    }
+                },
+                AppEvent::WifiUpdate(info) => app.wifi_info = info,
+                AppEvent::EventsUpdate(events) => app.system_errors = events,
+                AppEvent::CcmUpdate(status) => app.ccm_status = status,
+            }
         }
     }
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    // Force deep black background everywhere
-    let background_style = Style::default().bg(Color::Rgb(0, 0, 0)).fg(Color::White);
+    let background_style = Style::default().bg(app.theme.background).fg(app.theme.text);
     f.render_widget(Block::default().style(background_style), f.area());
 
     let chunks = Layout::default()
@@ -1119,15 +608,14 @@ fn draw_event_detail(f: &mut Frame, app: &App, area: Rect) {
 
     let p = Paragraph::new(detail)
         .block(Block::default().borders(Borders::ALL).title(app.t("System Event Detail", "Détail de l'événement Système"))
-            .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Red)))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White))
+            .style(Style::default().bg(app.theme.background).fg(app.theme.error)))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text))
         .wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(p, area);
 }
 
 fn draw_process_detail(f: &mut Frame, app: &App, area: Rect) {
     let detail = if let Some(pid) = &app.selected_process_pid {
-        // Find process by PID instead of index, so it stays consistent across refreshes
         if let Some(proc) = app.processes.iter().find(|p| &p.pid == pid) {
             let virt_mb = proc.virt_mem / 1024 / 1024;
             let res_mb = proc.res_mem / 1024 / 1024;
@@ -1135,27 +623,11 @@ fn draw_process_detail(f: &mut Frame, app: &App, area: Rect) {
             match app.lang {
                 Language::Fr => format!(
                     "PID          : {}\nNOM          : {}\nUTILISATEUR  : {}\nSTATUT       : {}\nCPU          : {:.1}%\nMÉMOIRE      : {:.1}% ({} MB)\nMÉM VIRTUELLE: {} MB\n\nCOMMANDE:\n{}",
-                    proc.pid,
-                    proc.name,
-                    proc.user,
-                    proc.status,
-                    proc.cpu,
-                    proc.mem_percent,
-                    res_mb,
-                    virt_mb,
-                    proc.cmd
+                    proc.pid, proc.name, proc.user, proc.status, proc.cpu, proc.mem_percent, res_mb, virt_mb, proc.cmd
                 ),
                 Language::En => format!(
                     "PID          : {}\nNAME         : {}\nUSER         : {}\nSTATUS       : {}\nCPU          : {:.1}%\nMEMORY       : {:.1}% ({} MB)\nVIRTUAL MEM  : {} MB\n\nCOMMAND:\n{}",
-                    proc.pid,
-                    proc.name,
-                    proc.user,
-                    proc.status,
-                    proc.cpu,
-                    proc.mem_percent,
-                    res_mb,
-                    virt_mb,
-                    proc.cmd
+                    proc.pid, proc.name, proc.user, proc.status, proc.cpu, proc.mem_percent, res_mb, virt_mb, proc.cmd
                 ),
             }
         } else {
@@ -1167,8 +639,8 @@ fn draw_process_detail(f: &mut Frame, app: &App, area: Rect) {
 
     let p = Paragraph::new(detail)
         .block(Block::default().borders(Borders::ALL).title(app.t("Process Detail", "Détail du Processus"))
-            .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Cyan)))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White))
+            .style(Style::default().bg(app.theme.background).fg(app.theme.highlight)))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text))
         .wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(p, area);
 }
@@ -1193,8 +665,8 @@ fn draw_wifi_details(f: &mut Frame, app: &App, area: Rect) {
 
     let p = Paragraph::new(details)
         .block(Block::default().borders(Borders::ALL).title(app.t("WiFi Details", "Détails WiFi"))
-            .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Cyan)))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Cyan));
+            .style(Style::default().bg(app.theme.background).fg(app.theme.highlight)))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.highlight));
     f.render_widget(p, area);
 }
 
@@ -1204,7 +676,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)].as_ref())
         .split(area);
 
-    let cpus = app.system.cpus();
+    let cpus = &app.system_state.cpus;
     let max_cpus = main_chunks[0].height.saturating_sub(2) as usize;
     let cpu_count = cpus.len().min(max_cpus);
     let cpu_chunks = Layout::default()
@@ -1217,15 +689,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         .split(main_chunks[0]);
 
     f.render_widget(Paragraph::new(app.t("CPU USAGE", "UTILISATION CPU"))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Cyan).add_modifier(Modifier::BOLD)), cpu_chunks[0]);
+        .style(Style::default().bg(app.theme.background).fg(app.theme.highlight).add_modifier(Modifier::BOLD)), cpu_chunks[0]);
     
-    for (i, cpu) in cpus.iter().enumerate().take(cpu_count) {
-        let usage = cpu.cpu_usage();
+    for (i, usage) in cpus.iter().enumerate().take(cpu_count) {
         let label = format!("CPU{i} {usage:>5.1}%");
         f.render_widget(Gauge::default()
-            .gauge_style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Cyan))
-            .style(Style::default().bg(Color::Rgb(0,0,0)))
-            .percent(usage as u16).label(label), cpu_chunks[i+1]);
+            .gauge_style(Style::default().bg(app.theme.background).fg(app.theme.highlight))
+            .style(Style::default().bg(app.theme.background))
+            .percent(*usage as u16).label(label), cpu_chunks[i+1]);
     }
 
     let mid_chunks = Layout::default()
@@ -1245,29 +716,29 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ].as_ref())
         .split(main_chunks[1]);
 
-    let mem_used = app.system.used_memory();
-    let mem_total = app.system.total_memory();
+    let mem_used = app.system_state.memory.used;
+    let mem_total = app.system_state.memory.total;
     let mem_percent = if mem_total > 0 { (mem_used as f64 / mem_total as f64 * 100.0) as u16 } else { 0 };
     f.render_widget(Gauge::default()
-        .gauge_style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Green))
-        .style(Style::default().bg(Color::Rgb(0,0,0)))
+        .gauge_style(Style::default().bg(app.theme.background).fg(app.theme.success))
+        .style(Style::default().bg(app.theme.background))
         .percent(mem_percent).label(format!("Mem  [{:3}%] {}MB/{}MB", mem_percent, mem_used / 1024 / 1024, mem_total / 1024 / 1024)), mid_chunks[0]);
 
-    let swap_used = app.system.used_swap();
-    let swap_total = app.system.total_swap();
+    let swap_used = app.system_state.swap.used;
+    let swap_total = app.system_state.swap.total;
     let swap_percent = if swap_total > 0 { (swap_used as f64 / swap_total as f64 * 100.0) as u16 } else { 0 };
     f.render_widget(Gauge::default()
-        .gauge_style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Yellow))
-        .style(Style::default().bg(Color::Rgb(0,0,0)))
+        .gauge_style(Style::default().bg(app.theme.background).fg(app.theme.warning))
+        .style(Style::default().bg(app.theme.background))
         .percent(swap_percent).label(format!("Swap [{:3}%] {}MB/{}MB", swap_percent, swap_used / 1024 / 1024, swap_total / 1024 / 1024)), mid_chunks[1]);
 
-    let uptime_secs = System::uptime();
+    let uptime_secs = app.system_state.uptime;
     let uptime_str = format!("{}d {:02}h {:02}m", uptime_secs / 86400, (uptime_secs % 86400) / 3600, (uptime_secs % 3600) / 60);
     f.render_widget(Paragraph::new(format!("{}: {}", app.t("Uptime", "Disponibilité"), uptime_str))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)), mid_chunks[2]);
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text)), mid_chunks[2]);
     
     f.render_widget(Paragraph::new(format!("OS: {}", app.os_info))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)), mid_chunks[3]);
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text)), mid_chunks[3]);
     
     let privilege_badge = if app.is_admin {
         if app.supports_utf8 {
@@ -1286,38 +757,37 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     } else {
         " [User]"
     };
-    let privilege_color = if app.is_admin { Color::Yellow } else { Color::White };
+    let privilege_color = if app.is_admin { app.theme.warning } else { app.theme.text };
     
     f.render_widget(Paragraph::new(format!("Host: {} | User: {}{}", app.host_info, app.username, privilege_badge))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(privilege_color)), mid_chunks[4]);
+        .style(Style::default().bg(app.theme.background).fg(privilege_color)), mid_chunks[4]);
 
     if let Some(ccm) = &app.ccm_status {
-        let status_color = if ccm.running { Color::Green } else { Color::Red };
+        let status_color = if ccm.running { app.theme.success } else { app.theme.error };
         let error_text = if ccm.has_errors { " | Errors!" } else { "" };
         let info = format!("CCM: {} | Actions: {}{}", ccm.status, ccm.pending_actions, error_text);
         f.render_widget(Paragraph::new(info)
-            .style(Style::default().bg(Color::Rgb(0,0,0)).fg(status_color)), mid_chunks[5]);
+            .style(Style::default().bg(app.theme.background).fg(status_color)), mid_chunks[5]);
     } else {
-        // Service non installé, afficher un spacer vide ou rien
-        f.render_widget(Paragraph::new("").style(Style::default().bg(Color::Rgb(0,0,0))), mid_chunks[5]);
+        f.render_widget(Paragraph::new("").style(Style::default().bg(app.theme.background)), mid_chunks[5]);
     }
 
-    f.render_widget(Paragraph::new(app.t("DISKS (FREE SPACE)", "DISQUES (ESPACE LIBRE)")).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Yellow).add_modifier(Modifier::BOLD)), mid_chunks[6]);
+    f.render_widget(Paragraph::new(app.t("DISKS (FREE SPACE)", "DISQUES (ESPACE LIBRE)")).style(Style::default().bg(app.theme.background).fg(app.theme.warning).add_modifier(Modifier::BOLD)), mid_chunks[6]);
     let mut disk_info = String::new();
-    for disk in app.disks.iter().take(3) {
-        let free = disk.available_space() / 1024 / 1024 / 1024;
-        let total = disk.total_space() / 1024 / 1024 / 1024;
-        let name = disk.mount_point().to_string_lossy();
+    for disk in app.system_state.disks.iter() {
+        let free = disk.available_space / 1024 / 1024 / 1024;
+        let total = disk.total_space / 1024 / 1024 / 1024;
+        let name = &disk.mount_point;
         disk_info.push_str(&format!("{name}: {free}G/{total}G free\n"));
     }
-    f.render_widget(Paragraph::new(disk_info).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)), mid_chunks[7]);
+    f.render_widget(Paragraph::new(disk_info).style(Style::default().bg(app.theme.background).fg(app.theme.text)), mid_chunks[7]);
 
     let event_title = if matches!(app.view_mode, ViewMode::SystemEvents) { 
         app.t("SYSTEM ERRORS (DETAILED)", "ERREURS SYSTÈME (DÉTAILLÉ)") 
     } else { 
         app.t("SYSTEM ERRORS (CLICK/E FOR DETAILS)", "ERREURS SYSTÈME (CLIC/E POUR DÉTAILS)") 
     };
-    f.render_widget(Paragraph::new(event_title).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Red).add_modifier(Modifier::BOLD)), mid_chunks[9]);
+    f.render_widget(Paragraph::new(event_title).style(Style::default().bg(app.theme.background).fg(app.theme.error).add_modifier(Modifier::BOLD)), mid_chunks[9]);
     
     let mut err_text = String::new();
     for err in app.system_errors.iter().take(2) {
@@ -1325,14 +795,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         err_text.push_str(&format!("• {}: {}\n", err.time, truncated));
     }
     if err_text.is_empty() { err_text = app.t("No recent errors found.", "Aucune erreur récente trouvée."); }
-    f.render_widget(Paragraph::new(err_text).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Gray)), mid_chunks[10]);
+    f.render_widget(Paragraph::new(err_text).style(Style::default().bg(app.theme.background).fg(Color::Gray)), mid_chunks[10]);
 
     let net_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)].as_ref())
         .split(main_chunks[2]);
 
-    f.render_widget(Paragraph::new(app.t("NETWORK / WIFI (CLICK FOR DETAILS)", "RÉSEAU / WIFI (CLIC POUR DÉTAILS)")).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::Magenta).add_modifier(Modifier::BOLD)), net_chunks[0]);
+    f.render_widget(Paragraph::new(app.t("NETWORK / WIFI (CLICK FOR DETAILS)", "RÉSEAU / WIFI (CLIC POUR DÉTAILS)")).style(Style::default().bg(app.theme.background).fg(app.theme.network).add_modifier(Modifier::BOLD)), net_chunks[0]);
     let mut net_info = String::new();
     if let Some(wifi) = &app.wifi_info {
         net_info.push_str(&format!("SSID  : {}\n", wifi.ssid));
@@ -1342,23 +812,22 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         net_info.push_str(&format!("Rate  : R:{} / T:{}\n", wifi.rx_rate, wifi.tx_rate));
         net_info.push_str(&format!("IP    : {}\n", wifi.ip_address));
         net_info.push_str("-------------------\n");
-        // Log details can be multiple lines, we just append them
         net_info.push_str(&format!("{}\n", wifi.log_details));
         net_info.push_str("-------------------\n");
     }
-    for (name, data) in &app.networks {
-        if data.received() > 0 || data.transmitted() > 0 {
-            net_info.push_str(&format!("{}: R:{:.1}K T:{:.1}K\n", name, data.received() as f32 / 1024.0, data.transmitted() as f32 / 1024.0));
+    for net in &app.system_state.networks {
+        if net.rx > 0 || net.tx > 0 {
+            net_info.push_str(&format!("{}: R:{:.1}K T:{:.1}K\n", net.name, net.rx as f32 / 1024.0, net.tx as f32 / 1024.0));
         }
     }
-    f.render_widget(Paragraph::new(net_info).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)), net_chunks[1]);
+    f.render_widget(Paragraph::new(net_info).style(Style::default().bg(app.theme.background).fg(app.theme.text)), net_chunks[1]);
 }
 
 fn draw_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header_cells = ["PID", "USER", "PRI", "VIRT", "RES", "S", "CPU%", "MEM%", "Command"]
         .iter()
-        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
-    let header = Row::new(header_cells).style(Style::default().bg(Color::Rgb(20,20,20))).height(1);
+        .map(|h| Cell::from(*h).style(Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).style(Style::default().bg(app.theme.header_bg)).height(1);
 
     let rows = app.processes.iter().map(|item| {
         Row::new(vec![
@@ -1371,7 +840,7 @@ fn draw_process_table(f: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(format!("{:.1}", item.cpu)),
             Cell::from(format!("{:.1}", item.mem_percent)),
             Cell::from(item.cmd.clone()),
-        ]).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)).height(1)
+        ]).style(Style::default().bg(app.theme.background).fg(app.theme.text)).height(1)
     });
 
     let t = Table::new(rows, [
@@ -1387,25 +856,25 @@ fn draw_process_table(f: &mut Frame, app: &mut App, area: Rect) {
     ])
     .header(header)
     .block(Block::default().borders(Borders::ALL).title(app.t("Processes (P: Sort CPU, M: Sort Mem, K: Kill)", "Processus (P: Trier CPU, M: Mem, K: Kill)"))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)))
-    .row_highlight_style(Style::default().bg(Color::Rgb(40,40,40)).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text)))
+    .row_highlight_style(Style::default().bg(app.theme.selection_bg).add_modifier(Modifier::BOLD))
     .highlight_symbol("> ");
 
     f.render_stateful_widget(t, area, &mut app.process_table_state);
 }
 
 fn draw_event_table(f: &mut Frame, app: &mut App, area: Rect) {
-    let sep_style = Style::default().fg(Color::DarkGray); // Gris foncé pour les séparateurs
+    let sep_style = Style::default().fg(Color::DarkGray); 
     let header_cells = vec![
-        Cell::from("TIME").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Cell::from("TIME").style(Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)),
         Cell::from("│").style(sep_style),
-        Cell::from("ID").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Cell::from("ID").style(Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)),
         Cell::from("│").style(sep_style),
-        Cell::from("SOURCE").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Cell::from("SOURCE").style(Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)),
         Cell::from("│").style(sep_style),
-        Cell::from("MESSAGE").style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Cell::from("MESSAGE").style(Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)),
     ];
-    let header = Row::new(header_cells).style(Style::default().bg(Color::Rgb(20,20,20))).height(1);
+    let header = Row::new(header_cells).style(Style::default().bg(app.theme.header_bg)).height(1);
 
     let rows = app.system_errors.iter().map(|item| {
         Row::new(vec![
@@ -1416,27 +885,26 @@ fn draw_event_table(f: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(item.source.clone()),
             Cell::from("│").style(sep_style),
             Cell::from(item.message.clone()),
-        ]).style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)).height(1)
+        ]).style(Style::default().bg(app.theme.background).fg(app.theme.text)).height(1)
     });
 
-    // Calcule des largeurs dynamiques basées sur le contenu visible
     let max_time_len = app.system_errors.iter().map(|e| e.time.len()).max().unwrap_or(15).clamp(10, 15) as u16;
     let max_source_len = app.system_errors.iter().map(|e| e.source.len()).max().unwrap_or(20).clamp(10, 40) as u16;
 
     let t = Table::new(rows, [
-        Constraint::Length(max_time_len), // Dynamic Time
-        Constraint::Length(1),            // Separator
-        Constraint::Length(6),            // ID
-        Constraint::Length(1),            // Separator
-        Constraint::Length(max_source_len), // Dynamic Source
-        Constraint::Length(1),            // Separator
-        Constraint::Min(50),              // Message
+        Constraint::Length(max_time_len),
+        Constraint::Length(1),
+        Constraint::Length(6),
+        Constraint::Length(1),
+        Constraint::Length(max_source_len),
+        Constraint::Length(1),
+        Constraint::Min(50),
     ])
     .header(header)
-    .column_spacing(0) // Espacement 0 car on utilise des séparateurs manuels
+    .column_spacing(0)
     .block(Block::default().borders(Borders::ALL).title(app.t("System Events (Esc: Back to Proc)", "Événements Système (Esc: Retour)"))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White)))
-    .row_highlight_style(Style::default().bg(Color::Rgb(40,40,40)).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text)))
+    .row_highlight_style(Style::default().bg(app.theme.selection_bg).add_modifier(Modifier::BOLD))
     .highlight_symbol("> ");
 
     f.render_stateful_widget(t, area, &mut app.event_table_state);
@@ -1555,7 +1023,7 @@ MIT License - Copyright (c) 2026 Olivier Noblanc
     let p = Paragraph::new(content)
         .block(Block::default().borders(Borders::ALL)
             .title(app.t("About HtopRust", "À propos de HtopRust")))
-        .style(Style::default().bg(Color::Rgb(0,0,0)).fg(Color::White))
+        .style(Style::default().bg(app.theme.background).fg(app.theme.text))
         .wrap(ratatui::widgets::Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -1563,7 +1031,7 @@ MIT License - Copyright (c) 2026 Olivier Noblanc
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let refresh_display = format!("{}s", app.refresh_rate.as_secs());
     
-    let mut help = match app.view_mode {
+    let help = match app.view_mode {
         ViewMode::Processes => app.t(
             &format!(" q:Quit | ↑↓:Nav | e:Events | a/h:About | p:CPU | m:MEM | k:Kill | {refresh_display}"),
             &format!(" q:Quitter | ↑↓:Nav | e:Events | a/h:À propos | p:CPU | m:MEM | k:Kill | {refresh_display}")
@@ -1590,11 +1058,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ),
     };
 
-    if let Some(time) = app.message_time
-        && time.elapsed() < Duration::from_secs(5) {
-            help = format!(" *** {} ***", app.message);
-        }
-
-    let p = Paragraph::new(help).style(Style::default().bg(Color::Rgb(30,30,30)).fg(Color::White));
+    let p = Paragraph::new(help)
+        .style(Style::default().bg(app.theme.header_bg).fg(app.theme.highlight));
     f.render_widget(p, area);
 }

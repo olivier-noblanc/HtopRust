@@ -401,9 +401,13 @@ fn main() -> Result<()> {
         eprintln!("-------------------------\n");
     }));
 
-    enable_raw_mode()?;
+    // Let's try to enable raw mode but don't crash if it fails (SCCM/Remote PS)
+    let _ = enable_raw_mode();
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    
+    // We try to enter alternate screen and enable mouse capture, but continue if they fail
+    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
+    
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -427,9 +431,9 @@ fn main() -> Result<()> {
 
     let res = run_app(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    terminal.show_cursor()?;
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = terminal.show_cursor();
 
     if let Err(err) = res { println!("{err:?}") }
     Ok(())

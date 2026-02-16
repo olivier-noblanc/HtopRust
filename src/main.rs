@@ -397,7 +397,7 @@ fn main() -> Result<()> {
             println!("No interactive terminal detected. Falling back to plain text mode.");
             println!("Tip: use --plain when launching from remote tools like Open Console.");
         }
-        run_plain_mode();
+        run_plain_mode(demo_mode);
         return Ok(());
     }
     
@@ -421,7 +421,7 @@ fn main() -> Result<()> {
         let _ = disable_raw_mode();
         println!("Interactive terminal features are not available in this console.");
         println!("Falling back to plain text mode.");
-        run_plain_mode();
+        run_plain_mode(demo_mode);
         return Ok(());
     }
 
@@ -456,7 +456,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_plain_mode() {
+fn run_plain_mode(demo_mode: bool) {
     let mut sys = System::new_all();
     sys.refresh_all();
 
@@ -489,6 +489,34 @@ fn run_plain_mode() {
             process.memory() / 1024,
             process.name().to_string_lossy()
         );
+    }
+
+
+    let wifi_manager = WifiManager::new(demo_mode);
+    if let Some(wifi) = wifi_manager.get_wifi_details() {
+        println!("\nWi-Fi:");
+        println!("SSID        : {}", wifi.ssid);
+        println!("Signal      : {}", wifi.signal);
+        println!("Security    : {} / {}", wifi.auth, wifi.cipher);
+        println!("Link        : RX {} | TX {}", wifi.rx_rate, wifi.tx_rate);
+        if !wifi.log_details.is_empty() {
+            println!("802.1x      : {}", wifi.log_details);
+        }
+    } else {
+        println!("\nWi-Fi: unavailable (no active WLAN or insufficient rights)");
+    }
+
+    let events = EventManager::new().get_system_errors_detailed();
+    println!("\nRecent system errors (last 48h):");
+    if events.is_empty() {
+        println!("No critical/error events found.");
+    } else {
+        for event in events.iter().take(5) {
+            println!("- [{}] {} (ID {})", event.time, event.source, event.id);
+        }
+        if events.len() > 5 {
+            println!("... and {} more", events.len() - 5);
+        }
     }
 
     println!("\nInteractive controls are disabled in plain mode.");

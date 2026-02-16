@@ -50,7 +50,8 @@ pub fn process_status_to_string(status: ProcessStatus) -> String {
         ProcessStatus::Dead => "D",
         ProcessStatus::Stop => "T",
         _ => "?",
-    }.to_string()
+    }
+    .to_string()
 }
 
 // New structs for UI state

@@ -2,7 +2,7 @@ use std::env;
 
 fn main() {
     // Compiler les ressources Windows (icône et métadonnées)
-    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+    if env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS not set by Cargo") == "windows" {
         let mut res = winres::WindowsResource::new();
         res.set_icon("icon.ico");
         res.set("FileDescription", "System Monitor for Windows");

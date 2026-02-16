@@ -14,7 +14,7 @@ use ratatui::{
 use std::time::{Duration, Instant};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::io;
+use std::io::{self, IsTerminal};
 use sysinfo::{System, Networks, Disks, Users, Pid};
 
 mod system;
@@ -366,6 +366,7 @@ fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let demo_mode = args.iter().any(|arg| arg == "--demo" || arg == "-d");
+    let plain_mode = args.iter().any(|arg| arg == "--plain");
     
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("HtopRust v{}", env!("CARGO_PKG_VERSION"));
@@ -373,6 +374,7 @@ fn main() -> Result<()> {
         println!("Usage: HtopRust [OPTIONS]\n");
         println!("Options:");
         println!("  --demo, -d      Run in demo mode with anonymized data for screenshots");
+        println!("  --plain         Use plain text mode (recommended for limited remote consoles)");
         println!("  --help, -h      Show this help message");
         return Ok(());
     }
@@ -389,6 +391,15 @@ fn main() -> Result<()> {
     human_panic::setup_panic!();
     
     println!("Current OS: {}", std::env::consts::OS);
+
+    if plain_mode || !io::stdout().is_terminal() {
+        if !plain_mode {
+            println!("No interactive terminal detected. Falling back to plain text mode.");
+            println!("Tip: use --plain when launching from remote tools like Open Console.");
+        }
+        run_plain_mode();
+        return Ok(());
+    }
     
     // Panic hook...
      std::panic::set_hook(Box::new(move |info| {
@@ -401,13 +412,19 @@ fn main() -> Result<()> {
         eprintln!("-------------------------\n");
     }));
 
-    // Let's try to enable raw mode but don't crash if it fails (SCCM/Remote PS)
-    let _ = enable_raw_mode();
+    // Try interactive terminal setup. If it fails (common in SCCM/Open Console), fallback to plain mode.
+    let raw_mode_enabled = enable_raw_mode().is_ok();
     let mut stdout = io::stdout();
-    
-    // We try to enter alternate screen and enable mouse capture, but continue if they fail
-    let _ = execute!(stdout, EnterAlternateScreen, EnableMouseCapture);
-    
+    let alternate_enabled = execute!(stdout, EnterAlternateScreen, EnableMouseCapture).is_ok();
+
+    if !raw_mode_enabled || !alternate_enabled {
+        let _ = disable_raw_mode();
+        println!("Interactive terminal features are not available in this console.");
+        println!("Falling back to plain text mode.");
+        run_plain_mode();
+        return Ok(());
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -437,6 +454,45 @@ fn main() -> Result<()> {
 
     if let Err(err) = res { println!("{err:?}") }
     Ok(())
+}
+
+fn run_plain_mode() {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let total_mem = sys.total_memory() / 1024;
+    let used_mem = sys.used_memory() / 1024;
+    let uptime = System::uptime();
+
+    let cpu_avg = if sys.cpus().is_empty() {
+        0.0
+    } else {
+        sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
+    };
+
+    println!("\n=== HtopRust (Plain Mode) ===");
+    println!("Uptime      : {}h {}m", uptime / 3600, (uptime % 3600) / 60);
+    println!("CPU (avg)   : {:.1}%", cpu_avg);
+    println!("Memory      : {} MB / {} MB", used_mem, total_mem);
+    println!("Processes   : {}", sys.processes().len());
+
+    let mut processes: Vec<_> = sys.processes().values().collect();
+    processes.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("\nTop 10 processes by CPU:");
+    println!("PID\tCPU%\tMEM(MB)\tNAME");
+    for process in processes.into_iter().take(10) {
+        println!(
+            "{}\t{:.1}\t{}\t{}",
+            process.pid(),
+            process.cpu_usage(),
+            process.memory() / 1024,
+            process.name().to_string_lossy()
+        );
+    }
+
+    println!("\nInteractive controls are disabled in plain mode.");
+    println!("To use full TUI mode, run HtopRust in Windows Terminal, CMD, or PowerShell directly.");
 }
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {

@@ -94,6 +94,11 @@ Double-click `HtopRust.exe` or run from terminal:
 HtopRust.exe
 ```
 
+For limited remote consoles (e.g. SCCM Open Console), use plain mode:
+```bash
+HtopRust.exe --plain
+```
+
 ### Keyboard Shortcuts
 
 | Key | Action |

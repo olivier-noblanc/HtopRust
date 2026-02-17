@@ -94,6 +94,14 @@ Double-click `HtopRust.exe` or run from terminal:
 HtopRust.exe
 ```
 
+For limited remote consoles (e.g. SCCM Open Console), use plain mode:
+```bash
+HtopRust.exe --plain
+```
+
+In plain mode, HtopRust still outputs core specs: process summary, top CPU processes, Wi-Fi/security details (including 802.1x when available), and recent system errors from Event Log.
+The app can also auto-fallback to plain mode when it detects limited remote console hosts (e.g. OpenConsole/CCM parent process).
+
 ### Keyboard Shortcuts
 
 | Key | Action |

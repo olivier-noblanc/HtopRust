@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration as ChronoDuration, Local};
-use regex::Regex;
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 #[derive(Clone)]
 pub struct EventInfo {
@@ -14,9 +14,12 @@ pub struct EventInfo {
 pub struct EventManager;
 
 // Compile Regexes once
-static RE_TIME: Lazy<Regex> = Lazy::new(|| Regex::new(r#"TimeCreated SystemTime=['"]([^'"]+)['"]"#).unwrap());
-static RE_PROVIDER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"Provider Name=['"]([^'"]+)['"]"#).unwrap());
-static RE_EVENTID: Lazy<Regex> = Lazy::new(|| Regex::new(r#"<EventID[^>]*>(\d+)</EventID>"#).unwrap());
+static RE_TIME: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"TimeCreated SystemTime=['"]([^'"]+)['"]"#).unwrap());
+static RE_PROVIDER: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"Provider Name=['"]([^'"]+)['"]"#).unwrap());
+static RE_EVENTID: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"<EventID[^>]*>(\d+)</EventID>"#).unwrap());
 
 impl EventManager {
     pub fn new() -> Self {
@@ -27,7 +30,9 @@ impl EventManager {
     // Handles are properly closed with EvtClose.
     #[allow(unsafe_code)]
     pub fn get_system_errors_detailed(&self) -> Vec<EventInfo> {
-        use windows::Win32::System::EventLog::{EvtQuery, EvtNext, EVT_HANDLE, EvtRender, EvtClose, EvtFormatMessage};
+        use windows::Win32::System::EventLog::{
+            EVT_HANDLE, EvtClose, EvtFormatMessage, EvtNext, EvtQuery, EvtRender,
+        };
 
         // We can define a helper to fetch events from a channel
         let fetch_channel = |channel_name: &str| -> Vec<EventInfo> {
@@ -36,7 +41,8 @@ impl EventManager {
                 let channel_wide = windows::core::HSTRING::from(channel_name);
                 let channel_pcwstr = windows::core::PCWSTR(channel_wide.as_ptr());
 
-                let query_handle = match EvtQuery(None, channel_pcwstr, query, 0x201u32) { // EvtQueryChannelPath | EvtQueryReverseDirection
+                let query_handle = match EvtQuery(None, channel_pcwstr, query, 0x201u32) {
+                    // EvtQueryChannelPath | EvtQueryReverseDirection
                     Ok(handle) => handle,
                     Err(e) => {
                         // eprintln!("Failed to query {channel_name}: {e:?}");
@@ -50,7 +56,8 @@ impl EventManager {
                     }
                 };
 
-                let cutoff_time = Local::now() - ChronoDuration::try_hours(48).unwrap_or(ChronoDuration::hours(48));
+                let cutoff_time = Local::now()
+                    - ChronoDuration::try_hours(48).unwrap_or(ChronoDuration::hours(48));
                 let mut channel_events = Vec::new();
                 let mut events_buf: [isize; 10] = [0; 10]; // Array to hold event handles (isize/HANDLE)
                 let mut returned: u32 = 0;
@@ -69,56 +76,95 @@ impl EventManager {
                         let mut property_count: u32 = 0;
 
                         // First call to get buffer size
-                        let _ = EvtRender(None, event_handle, 1u32, buffer_size, None, &raw mut buffer_used, &raw mut property_count);
-                        
+                        let _ = EvtRender(
+                            None,
+                            event_handle,
+                            1u32,
+                            buffer_size,
+                            None,
+                            &raw mut buffer_used,
+                            &raw mut property_count,
+                        );
+
                         buffer_size = buffer_used;
                         let mut buffer: Vec<u16> = vec![0; (buffer_size / 2) as usize];
-                        
-                        let render_result = EvtRender(None, event_handle, 1u32, buffer_size, Some(buffer.as_mut_ptr().cast()), &raw mut buffer_used, &raw mut property_count);
+
+                        let render_result = EvtRender(
+                            None,
+                            event_handle,
+                            1u32,
+                            buffer_size,
+                            Some(buffer.as_mut_ptr().cast()),
+                            &raw mut buffer_used,
+                            &raw mut property_count,
+                        );
 
                         if render_result.is_ok() {
                             let xml = String::from_utf16_lossy(&buffer);
-                            
+
                             // Parse XML using Regex
                             if let Some(parsed) = Self::parse_event_xml_regex(&xml) {
                                 // Check time first
                                 if let Ok(dt) = DateTime::parse_from_rfc3339(&parsed.raw_time) {
                                     if dt < cutoff_time {
                                         let _ = EvtClose(event_handle);
-                                        // Since we fetch in reverse order, key assumption: 
+                                        // Since we fetch in reverse order, key assumption:
                                         // If we hit an event older than cutoff, we can stop fetching from this channel.
                                         // We must close pending handles in the buffer first.
-                                        for &pending_raw in events_buf.iter().take(returned as usize) {
+                                        for &pending_raw in
+                                            events_buf.iter().take(returned as usize)
+                                        {
                                             if pending_raw != event_raw {
                                                 let _ = EvtClose(EVT_HANDLE(pending_raw));
                                             }
                                         }
                                         let _ = EvtClose(query_handle);
-                                        return channel_events; 
+                                        return channel_events;
                                     }
                                 }
 
                                 let mut msg_buffer_used: u32 = 0;
-                                let _ = EvtFormatMessage(None, Some(event_handle), 0, None, 1u32, None, &raw mut msg_buffer_used);
-                                
+                                let _ = EvtFormatMessage(
+                                    None,
+                                    Some(event_handle),
+                                    0,
+                                    None,
+                                    1u32,
+                                    None,
+                                    &raw mut msg_buffer_used,
+                                );
+
                                 let msg_buffer_size = msg_buffer_used;
                                 let mut msg_buffer: Vec<u16> = vec![0; msg_buffer_size as usize];
-                                
+
                                 let mut full_message = String::new();
                                 let mut found_msg = false;
 
                                 if msg_buffer_size > 0
-                                    && EvtFormatMessage(None, Some(event_handle), 0, None, 1u32, Some(&mut msg_buffer), &raw mut msg_buffer_used).is_ok() {
-                                        let msg = String::from_utf16_lossy(&msg_buffer);
-                                        let clean_msg = msg.trim_end_matches('\0').trim().to_string();
-                                        if !clean_msg.is_empty() {
-                                            full_message = clean_msg;
-                                            found_msg = true;
-                                        }
+                                    && EvtFormatMessage(
+                                        None,
+                                        Some(event_handle),
+                                        0,
+                                        None,
+                                        1u32,
+                                        Some(&mut msg_buffer),
+                                        &raw mut msg_buffer_used,
+                                    )
+                                    .is_ok()
+                                {
+                                    let msg = String::from_utf16_lossy(&msg_buffer);
+                                    let clean_msg = msg.trim_end_matches('\0').trim().to_string();
+                                    if !clean_msg.is_empty() {
+                                        full_message = clean_msg;
+                                        found_msg = true;
                                     }
+                                }
 
                                 if !found_msg {
-                                    full_message = format!("Event {} from {}", parsed.event_id, parsed.provider);
+                                    full_message = format!(
+                                        "Event {} from {}",
+                                        parsed.event_id, parsed.provider
+                                    );
                                 }
 
                                 let display_source = if channel_name == "Application" {
@@ -128,7 +174,9 @@ impl EventManager {
                                 };
 
                                 // Format time for display
-                                let time_fmt = if let Ok(dt) = DateTime::parse_from_rfc3339(&parsed.raw_time) {
+                                let time_fmt = if let Ok(dt) =
+                                    DateTime::parse_from_rfc3339(&parsed.raw_time)
+                                {
                                     dt.with_timezone(&Local).format("%d/%m %H:%M").to_string()
                                 } else {
                                     parsed.raw_time.clone()
@@ -153,26 +201,29 @@ impl EventManager {
 
         let mut all_events = fetch_channel("System");
         let mut app_events = fetch_channel("Application");
-        
+
         all_events.append(&mut app_events);
 
         // Sort by raw_time descending (newest first)
         all_events.sort_by(|a, b| b.raw_time.cmp(&a.raw_time));
-        
+
         all_events
     }
 
     fn parse_event_xml_regex(xml: &str) -> Option<ParsedEvent> {
-        let raw_time = RE_TIME.captures(xml)
+        let raw_time = RE_TIME
+            .captures(xml)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str().to_string())?;
 
-        let provider = RE_PROVIDER.captures(xml)
+        let provider = RE_PROVIDER
+            .captures(xml)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str().to_string())
             .unwrap_or_else(|| "Unknown".to_string());
 
-        let event_id = RE_EVENTID.captures(xml)
+        let event_id = RE_EVENTID
+            .captures(xml)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str().to_string())
             .unwrap_or_else(|| "0".to_string());

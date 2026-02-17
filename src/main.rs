@@ -10,13 +10,11 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table, TableState},
 };
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
-use std::io::{self, IsTerminal};
 use sysinfo::{System, Networks, Disks, Users, Pid};
 use std::time::{Duration, Instant};
-use sysinfo::{Disks, Networks, Pid, System, Users};
 
 mod events;
 mod system;
@@ -428,13 +426,46 @@ fn spawn_worker(state: Arc<RwLock<AppState>>, rx: mpsc::Receiver<AppAction>, dem
     });
 }
 
+// Helper to check for interactive console capabilities
+fn has_interactive_console_capabilities() -> bool {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let handle_result = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle_result.is_err() {
+            return false;
+        }
+        let handle = handle_result.unwrap();
+        if handle.is_invalid() {
+            return false;
+        }
+
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(handle, &raw mut mode).is_err() {
+            return false;
+        }
+
+        // Check if we can enable Virtual Terminal Processing (ANSI sequences)
+        if (mode.0 & ENABLE_VIRTUAL_TERMINAL_PROCESSING.0) == 0 {
+            // Try to enable it
+            let new_mode = CONSOLE_MODE(mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0);
+            if windows::Win32::System::Console::SetConsoleMode(handle, new_mode).is_err() {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
 fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let demo_mode = args.iter().any(|arg| arg == "--demo" || arg == "-d");
-    let plain_mode = args.iter().any(|arg| arg == "--plain");
-    
-    let _plain_mode = args.iter().any(|arg| arg == "--plain");
+    let plain_arg = args.iter().any(|arg| arg == "--plain");
 
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("HtopRust v{}", env!("CARGO_PKG_VERSION"));
@@ -442,7 +473,7 @@ fn main() -> Result<()> {
         println!("Usage: HtopRust [OPTIONS]\n");
         println!("Options:");
         println!("  --demo, -d      Run in demo mode with anonymized data for screenshots");
-        println!("  --plain         Use plain text mode (recommended for limited remote consoles)");
+        println!("  --plain         Force plain text mode (recommended for limited remote consoles)");
         println!("  --help, -h      Show this help message");
         return Ok(());
     }
@@ -468,67 +499,64 @@ fn main() -> Result<()> {
 
     println!("Current OS: {}", std::env::consts::OS);
 
-    let stdin_is_tty = io::stdin().is_terminal();
-    let stdout_is_tty = io::stdout().is_terminal();
-    let limited_remote_console = is_limited_remote_console();
+    // Initial check for interactivity logic
+    let is_tty = io::stdout().is_terminal();
     let console_capable = has_interactive_console_capabilities();
+    let use_plain_mode = plain_arg || !is_tty || !console_capable;
 
-    if plain_mode || !stdin_is_tty || !stdout_is_tty || limited_remote_console || !console_capable {
-        if !plain_mode {
-            if limited_remote_console {
-                println!("Limited remote console detected (OpenConsole/CCM). Falling back to plain text mode.");
-            } else if !console_capable {
-                println!("Console host lacks required interactive capabilities. Falling back to plain text mode.");
-            } else {
-                println!("No interactive terminal detected. Falling back to plain text mode.");
-            }
-            println!("Tip: use --plain when launching from remote tools like Open Console.");
+    if !use_plain_mode {
+        // Attempt to start Full TUI
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), crossterm::cursor::Show);
+            default_hook(info);
+        }));
+    } else {
+        // Fallback message
+        if !plain_arg {
+             println!("Running in plain mode (limited console capabilities detected).");
+             println!("Use --plain to suppress this reasoning or force this mode.");
+             if !is_tty {
+                 println!("Reason: Not a TTY");
+             } else if !console_capable {
+                 println!("Reason: Missing ENABLE_VIRTUAL_TERMINAL_PROCESSING capability");
+             }
         }
-        run_plain_mode(demo_mode);
-        return Ok(());
+        
+        // Plain mode panic hook
+        std::panic::set_hook(Box::new(move |info| {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, crossterm::cursor::Show);
+            eprintln!("\n--- APPLICATION CRASH ---");
+            eprintln!("{info}");
+            eprintln!("-------------------------\n");
+        }));
     }
-    
-    // Force TUI mode even if not a terminal (SCCM/WinRM support)
-    // if plain_mode || !io::stdout().is_terminal() { ... } removed
 
-    if demo_mode {
-        println!("Running in DEMO MODE - Anonymized data for screenshots");
-    }
-
-    // Panic hook...
-    std::panic::set_hook(Box::new(move |info| {
+    // Setup Backend
+    let mut terminal = if use_plain_mode {
+         // Plain Mode (Inline)
+         let stdout = io::stdout();
+         let backend = CrosstermBackend::new(stdout);
+         Terminal::new(backend)?
+    } else {
+        // Full TUI Mode
+        crossterm::terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, crossterm::cursor::Show);
-        eprintln!("\n--- APPLICATION CRASH ---");
-        eprintln!("{info}");
-        eprintln!("-------------------------\n");
-    }));
+        execute!(stdout, crossterm::terminal::EnterAlternateScreen, event::EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        Terminal::new(backend)?
+    };
 
-    // Try interactive terminal setup. If it fails (common in SCCM/Open Console), fallback to plain mode.
-    let raw_mode_enabled = enable_raw_mode().is_ok();
-    let mut stdout = io::stdout();
-    let alternate_enabled = execute!(stdout, EnterAlternateScreen, EnableMouseCapture).is_ok();
 
-    if !raw_mode_enabled || !alternate_enabled {
-        let _ = disable_raw_mode();
-        println!("Interactive terminal features are not available in this console.");
-        println!("Falling back to plain text mode.");
-        run_plain_mode(demo_mode);
-        return Ok(());
+    if use_plain_mode {
+         let _ = execute!(
+            io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
     }
-
-    // Force Plain Mode (Inline TUI) as requested:
-    // No Raw Mode, No Alternate Screen, No Mouse Capture.
-    // We render directly to stdout.
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Initial clear for a clean slate
-    let _ = execute!(
-        io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-    );
 
     // Shared State
     let initial_state = AppState {
@@ -548,8 +576,17 @@ fn main() -> Result<()> {
 
     spawn_worker(worker_state, action_rx, demo_mode);
 
-    let res = run_app(&mut terminal, &mut app);
+    let res = run_app(&mut terminal, &mut app, use_plain_mode);
 
+    // Cleanup
+    if !use_plain_mode {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen,
+            event::DisableMouseCapture
+        );
+    }
     let _ = terminal.show_cursor();
 
     if let Err(err) = res {
@@ -558,144 +595,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn has_interactive_console_capabilities() -> bool {
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_PROCESSED_OUTPUT,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    };
-
-    #[allow(unsafe_code)]
-    unsafe {
-        let stdin_handle = match GetStdHandle(STD_INPUT_HANDLE) {
-            Ok(h) if h != INVALID_HANDLE_VALUE => h,
-            _ => return false,
-        };
-        let stdout_handle = match GetStdHandle(STD_OUTPUT_HANDLE) {
-            Ok(h) if h != INVALID_HANDLE_VALUE => h,
-            _ => return false,
-        };
-
-        let mut in_mode: u32 = 0;
-        if GetConsoleMode(stdin_handle, &mut in_mode).is_err() {
-            return false;
-        }
-
-        let mut out_mode: u32 = 0;
-        if GetConsoleMode(stdout_handle, &mut out_mode).is_err() {
-            return false;
-        }
-
-        let desired_out = out_mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-        if SetConsoleMode(stdout_handle, desired_out).is_err() {
-            return false;
-        }
-
-        let _ = SetConsoleMode(stdout_handle, out_mode);
-        true
-    }
-}
-
-fn is_limited_remote_console() -> bool {
-    let mut sys = System::new_all();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-    let Ok(pid) = sysinfo::get_current_pid() else {
-        return false;
-    };
-
-    let mut current = Some(pid);
-    for _ in 0..4 {
-        let Some(p) = current else {
-            break;
-        };
-        let Some(proc_) = sys.process(p) else {
-            break;
-        };
-
-        let name = proc_.name().to_string_lossy().to_lowercase();
-        if name.contains("openconsole") || name.contains("ccm") {
-            return true;
-        }
-        current = proc_.parent();
-    }
-
-    false
-}
-
-fn run_plain_mode(demo_mode: bool) {
-    let mut sys = System::new_all();
-    sys.refresh_all();
-
-    let total_mem = sys.total_memory() / 1024;
-    let used_mem = sys.used_memory() / 1024;
-    let uptime = System::uptime();
-
-    let cpu_avg = if sys.cpus().is_empty() {
-        0.0
-    } else {
-        sys.cpus().iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32
-    };
-
-    println!("\n=== HtopRust (Plain Mode) ===");
-    println!("Uptime      : {}h {}m", uptime / 3600, (uptime % 3600) / 60);
-    println!("CPU (avg)   : {:.1}%", cpu_avg);
-    println!("Memory      : {} MB / {} MB", used_mem, total_mem);
-    println!("Processes   : {}", sys.processes().len());
-
-    let mut processes: Vec<_> = sys.processes().values().collect();
-    processes.sort_by(|a, b| b.cpu_usage().partial_cmp(&a.cpu_usage()).unwrap_or(std::cmp::Ordering::Equal));
-
-    println!("\nTop 10 processes by CPU:");
-    println!("PID\tCPU%\tMEM(MB)\tNAME");
-    for process in processes.into_iter().take(10) {
-        println!(
-            "{}\t{:.1}\t{}\t{}",
-            process.pid(),
-            process.cpu_usage(),
-            process.memory() / 1024,
-            process.name().to_string_lossy()
-        );
-    }
 
 
-    let wifi_manager = WifiManager::new(demo_mode);
-    if let Some(wifi) = wifi_manager.get_wifi_details() {
-        println!("\nWi-Fi:");
-        println!("SSID        : {}", wifi.ssid);
-        println!("Signal      : {}", wifi.signal);
-        println!("Security    : {} / {}", wifi.auth, wifi.cipher);
-        println!("Link        : RX {} | TX {}", wifi.rx_rate, wifi.tx_rate);
-        if !wifi.log_details.is_empty() {
-            println!("802.1x      : {}", wifi.log_details);
-        }
-    } else {
-        println!("\nWi-Fi: unavailable (no active WLAN or insufficient rights)");
-    }
-
-    let events = EventManager::new().get_system_errors_detailed();
-    println!("\nRecent system errors (last 48h):");
-    if events.is_empty() {
-        println!("No critical/error events found.");
-    } else {
-        for event in events.iter().take(5) {
-            println!("- [{}] {} (ID {})", event.time, event.source, event.id);
-        }
-        if events.len() > 5 {
-            println!("... and {} more", events.len() - 5);
-        }
-    }
-
-    println!("\nInteractive controls are disabled in plain mode.");
-    println!("To use full TUI mode, run HtopRust in Windows Terminal, CMD, or PowerShell directly.");
-}
-
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, is_plain: bool) -> Result<()> {
     loop {
         // 1. Read Shared State
-        // In "Plain Mode" (Inline TUI), we need to clear or reset cursor to avoid infinite scrolling.
-        // We use crossterm to move cursor to (0,0) before drawing.
-        let _ = execute!(io::stdout(), crossterm::cursor::MoveTo(0, 0));
+        if is_plain {
+            // In "Plain Mode" (Inline TUI), we reset cursor to top-left of our render area
+            // to avoid infinite scrolling (simulating a repaint in place)
+            let _ = execute!(io::stdout(), crossterm::cursor::MoveTo(0, 0));
+        }
 
         {
             let state_arc = app.state.clone();
@@ -834,6 +743,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         event::MouseEventKind::ScrollDown => app.next_item(),
                         event::MouseEventKind::ScrollUp => app.previous_item(),
                         event::MouseEventKind::Down(event::MouseButton::Left) => {
+                            if is_plain {
+                                // Ignore mouse in plain mode if we want to be strict,
+                                // but if we get events, might as well handle them.
+                            }
                             let header_height = 18;
                             let total_width = terminal.size()?.width;
                             let col1_end = total_width / 3;
